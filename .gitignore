@@ -1,0 +1,40 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Training checkpoints & model weights
+checkpoints/
+*.pth
+*.pt
+*.onnx
+*.h5
+*.ckpt
+
+# Datasets and training data
+dataset/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Exclude the checkpoint folder
+folder/
+
+# Exclude any tar archives and PyTorch checkpoint archives
+*.tar
+*.tar.gz
+*.pth
+*.pth.tar
+
+# Dataset directories (excludes all raw/training data images)
+dataset/
+data/
+datasets/
+checkpoints/
