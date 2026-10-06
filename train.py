@@ -7,6 +7,7 @@ import torch
 import torch.multiprocessing as mp
 from matplotlib import pyplot as plt
 from torch import nn, optim
+from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 from tqdm import tqdm
@@ -23,8 +24,17 @@ from distributed_utils import (
     sum_across_processes,
 )
 from imageDatastore import imageDatastore
-from model_factory import COMPILE_MODES, available_architectures, build_model, compile_model
-from utils import Timer, adjust_learning_rate, load_checkpoint, save_checkpoint, setup_seed, time_text
+from losses import SGARNetLoss, load_vgg19_weights
+from model_factory import COMPILE_MODES, architecture_options, available_architectures, build_model, compile_model
+from utils import (
+    Timer,
+    adjust_learning_rate,
+    load_checkpoint,
+    save_checkpoint,
+    set_cosine_learning_rate,
+    setup_seed,
+    time_text,
+)
 from validation import ValidationTotals, accumulate_validation_totals, compute_validation_result
 
 
@@ -32,17 +42,40 @@ DEFAULT_DATA_PATH = r"C:\Users\onue687i\Documents\AirDent\TW Source Material\720
 
 type LossStats = dict[str, list[float]]
 
+# Training recipes:
+#   unet:    L1 loss, Adam, step decay (lr_DropFactor every lr_DropPeriod epochs), full images, no augmentation.
+#   sgarnet: options/train/MCFArtifactFree.yml of https://github.com/THUHoloLab/SGARNet: PSNR loss
+#            + 0.01 * VGG19 perceptual loss, AdamW, cosine decay per iteration, gradient clipping,
+#            random crops with flips and rot90.
+# --recipe auto picks the recipe named like --arch. Options left out on the command line get the
+# recipe's default below.
+RECIPE_DEFAULTS: dict[str, dict[str, object]] = {
+    "unet": {"lr": 1e-4, "batch_size": 4, "patch_size": 0, "augment": "none"},
+    "sgarnet": {"lr": 1e-3, "batch_size": 8, "patch_size": 368, "augment": "flips+rot90"},
+}
+SGARNET_WEIGHT_DECAY = 1e-3
+SGARNET_BETAS = (0.9, 0.9)
+SGARNET_ETA_MIN = 1e-7
+SGARNET_GRAD_CLIP_NORM = 0.01
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="net")
 
     # Training
     parser.add_argument("--num_epochs", default=50, type=int)
-    parser.add_argument("--batch_size", default=4, type=int, help="global batch size, split across all GPUs")
+    parser.add_argument("--recipe", default="auto", choices=["auto", *RECIPE_DEFAULTS],
+                        help="training recipe; auto: sgarnet for --arch sgarnet, otherwise unet")
+    parser.add_argument("--batch_size", default=None, type=int,
+                        help="global batch size, split across all GPUs (default: unet 4, sgarnet 8)")
     parser.add_argument("--val_batch_size", default=4, type=int, help="global batch size, split across all GPUs")
-    parser.add_argument("--lr", default=1e-4, type=float)
-    parser.add_argument("--lr_DropFactor", default=0.5, type=float)
-    parser.add_argument("--lr_DropPeriod", default=10, type=int)
+    parser.add_argument("--lr", default=None, type=float, help="initial learning rate (default: unet 1e-4, sgarnet 1e-3)")
+    parser.add_argument("--lr_DropFactor", default=0.5, type=float, help="unet recipe only")
+    parser.add_argument("--lr_DropPeriod", default=10, type=int, help="unet recipe only")
+    parser.add_argument("--patch_size", default=None, type=int,
+                        help="train on random square crops of this size, 0: full images (default: unet 0, sgarnet 368)")
+    parser.add_argument("--augment", default=None, choices=["none", "flips", "flips+rot90"],
+                        help="random flips / 90-degree rotations of the training images (default: unet none, sgarnet flips+rot90)")
     parser.add_argument("--save_everyEpoch", default=1, type=int)
     parser.add_argument("--save_path", default="./folder/", type=str)
     parser.add_argument("--valid_everyEpoch", default=1, type=int)
@@ -53,6 +86,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arch", default="unet", choices=available_architectures())
     parser.add_argument("--compile", action="store_true", help="optimize the model with torch.compile")
     parser.add_argument("--compile_mode", default="default", choices=COMPILE_MODES)
+    parser.add_argument("--sgarnet_lattice_period", default=None, type=float,
+                        help="SGARNet: core lattice period in input pixels, from estimate_lattice_period.py")
+    parser.add_argument("--sgarnet_lattice_angle", default=None, type=float,
+                        help="SGARNet: core lattice angle in degrees, from estimate_lattice_period.py")
 
     # Dataset
     parser.add_argument("--dir_ZTrain", default=os.path.join(DEFAULT_DATA_PATH, "HR_Train"), type=str)
@@ -70,7 +107,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rgb_range", default=1, type=int, help="maxium value of RGB")
     parser.add_argument("--seed", default=1, type=int)
     parser.add_argument("--ext", default=".png", type=str)
-    return parser.parse_args()
+    return resolve_recipe(parser.parse_args())
+
+
+def resolve_recipe(args: argparse.Namespace) -> argparse.Namespace:
+    if args.recipe == "auto":
+        args.recipe = "sgarnet" if args.arch == "sgarnet" else "unet"
+
+    for name, value in RECIPE_DEFAULTS[args.recipe].items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+    return args
 
 
 def create_train_loader(
@@ -80,10 +127,23 @@ def create_train_loader(
     dataset = imageDatastore(
         args.dir_ZTrain,
         args.dir_XTrain,
+        patches=args.patch_size > 0,
+        patch_size=args.patch_size,
         n_colors=args.n_colors,
         rgb_range=args.rgb_range,
+        hflip=args.augment != "none",
+        vflip=args.augment != "none",
+        rotate=args.augment == "flips+rot90",
         ext=args.ext,
     )
+
+    if args.patch_size > 0:
+        image_height, image_width = dataset._load_file(0)[0].shape[:2]
+        if args.patch_size > min(image_height, image_width):
+            raise ValueError(
+                f"--patch_size {args.patch_size} is larger than the training images ({image_height} x {image_width}). "
+                "Use a smaller --patch_size, or --patch_size 0 to train on full images."
+            )
 
     sampler: DistributedSampler | None = None
     if context.is_distributed:
@@ -164,17 +224,28 @@ def train_one_epoch(
     optimizer: optim.Optimizer,
     args: argparse.Namespace,
     context: DistributedContext,
-) -> float:
+) -> tuple[float, float]:
+    """Returns (L1 loss, training loss) averaged over the epoch. With the unet recipe both are the L1 loss."""
     model.train()
-    adjust_learning_rate(optimizer, epoch - 1, args.lr, args.lr_DropFactor, args.lr_DropPeriod)
+    first_iteration = (epoch - 1) * len(loader)
+    total_iterations = args.num_epochs * len(loader)
+    if args.recipe == "sgarnet":
+        set_cosine_learning_rate(optimizer, first_iteration, total_iterations, args.lr, SGARNET_ETA_MIN)
+    else:
+        adjust_learning_rate(optimizer, epoch - 1, args.lr, args.lr_DropFactor, args.lr_DropPeriod)
 
     learning_rate = optimizer.param_groups[0]["lr"]
     print_on_main(context, f"\n------- Epoch {epoch}/{args.num_epochs} \t\t lr = {learning_rate}")
 
     progress = tqdm(loader, desc="In training", leave=True, ncols=80, disable=not context.is_main_process)
     total_loss = 0.0
+    total_l1 = 0.0
 
-    for inputs, targets in progress:
+    for batch_index, (inputs, targets) in enumerate(progress):
+        if args.recipe == "sgarnet":
+            # Like the original, the cosine learning rate changes every iteration.
+            set_cosine_learning_rate(optimizer, first_iteration + batch_index, total_iterations, args.lr, SGARNET_ETA_MIN)
+
         inputs = inputs.to(context.device)
         targets = targets.float().to(context.device)
 
@@ -183,15 +254,28 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if args.recipe == "sgarnet":
+            nn.utils.clip_grad_norm_(model.parameters(), SGARNET_GRAD_CLIP_NORM)
         optimizer.step()
 
         loss_value = loss.item()
-        progress.set_postfix(loss=loss_value)
+        if args.recipe == "unet":
+            l1_value = loss_value
+            progress.set_postfix(loss=loss_value)
+        else:
+            l1_value = F.l1_loss(predictions.detach(), targets).item()
+            progress.set_postfix(loss=loss_value, l1=l1_value)
         total_loss += loss_value
+        total_l1 += l1_value
 
     epoch_loss = mean_across_processes(total_loss / len(loader), context)
-    print_on_main(context, f"\nTrain loss: {epoch_loss:.4f}")
-    return epoch_loss
+    if args.recipe == "unet":
+        print_on_main(context, f"\nTrain loss: {epoch_loss:.4f}")
+        return epoch_loss, epoch_loss
+
+    epoch_l1 = mean_across_processes(total_l1 / len(loader), context)
+    print_on_main(context, f"\nTrain loss: {epoch_loss:.4f} \t\t Train L1: {epoch_l1:.4f}")
+    return epoch_l1, epoch_loss
 
 
 def validate(
@@ -213,18 +297,28 @@ def validate(
     return result.loss
 
 
+def create_optimizer(network: nn.Module, args: argparse.Namespace) -> optim.Optimizer:
+    if args.recipe == "sgarnet":
+        return optim.AdamW(network.parameters(), lr=args.lr, weight_decay=SGARNET_WEIGHT_DECAY, betas=SGARNET_BETAS)
+    return optim.Adam(network.parameters(), lr=args.lr)
+
+
 def run_training(args: argparse.Namespace, context: DistributedContext) -> LossStats:
     setup_seed(args.seed + context.rank)
 
     train_loader, train_sampler = create_train_loader(args, context)
     valid_loader = create_valid_loader(args, context)
 
-    network = build_model(args.arch, in_channels=args.n_colors, out_channels=args.n_colors)
+    network = build_model(
+        args.arch, in_channels=args.n_colors, out_channels=args.n_colors, **architecture_options(args.arch, args)
+    )
     model_arch = copy.deepcopy(network)
     network = network.to(context.device)
 
+    # Validation (and the choice of the _best checkpoint) always uses the L1 loss, so all recipes are compared alike.
     criterion = nn.L1Loss().to(context.device)
-    optimizer = optim.Adam(network.parameters(), lr=args.lr)
+    training_criterion = SGARNetLoss().to(context.device) if args.recipe == "sgarnet" else criterion
+    optimizer = create_optimizer(network, args)
     loss_stats: LossStats = {"train": [], "valid": [], "valid_expt": []}
 
     if args.pretrain:
@@ -235,11 +329,17 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> LossS
         loss_stats = dict(checkpoint["loss_stats"])
 
     loss_stats.setdefault("valid_epoch", list(range(1, len(loss_stats["valid"]) + 1)))
+    if args.recipe != "unet":
+        loss_stats.setdefault("train_objective", [])
     best_valid_loss = min(loss_stats["valid"]) if loss_stats["valid"] else float("inf")
 
     training_model, validation_model = prepare_models(network, args, context)
 
-    print_on_main(context, "===> Training")
+    print_on_main(
+        context,
+        f"===> Training {args.arch} with the {args.recipe} recipe: lr {args.lr}, batch size {args.batch_size}, "
+        f"patch size {args.patch_size or 'full image'}, augment {args.augment}",
+    )
     code_start = datetime.datetime.now()
     timer = Timer()
 
@@ -249,8 +349,12 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> LossS
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        loss_train = train_one_epoch(epoch, training_model, train_loader, criterion, optimizer, args, context)
+        loss_train, objective_train = train_one_epoch(
+            epoch, training_model, train_loader, training_criterion, optimizer, args, context
+        )
         loss_stats["train"].append(loss_train)
+        if args.recipe != "unet":
+            loss_stats["train_objective"].append(objective_train)
 
         do_valid = epoch % args.valid_everyEpoch == 0 or epoch == args.num_epochs
         if do_valid:
@@ -319,8 +423,15 @@ def launch_distributed_training(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
 
+    # Stop now, before any GPU process starts, if a setting of the architecture is missing.
+    architecture_options(args.arch, args)
+
     # Create the checkpoint folder if it does not exist yet
     os.makedirs(args.save_path, exist_ok=True)
+
+    if args.recipe == "sgarnet":
+        # Download the VGG19 weights once here, so the GPU processes do not all download them at the same time.
+        load_vgg19_weights()
 
     if args.num_GPUs > 1:
         launch_distributed_training(args)

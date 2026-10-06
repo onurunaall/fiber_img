@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 import os
 import time
 import numpy as np
@@ -87,6 +88,13 @@ def save_predictions_as_imgs(loader, model, folder="saved_images/", device="cuda
 def adjust_learning_rate(optimizer, epoch, lr_init, gamma, step_size):
     factor = epoch // step_size
     lr = lr_init * (gamma ** factor)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+
+def set_cosine_learning_rate(optimizer, iteration, total_iterations, lr_init, eta_min):
+    # Closed form of torch.optim.lr_scheduler.CosineAnnealingLR(T_max=total_iterations); iteration starts at 0
+    lr = eta_min + (lr_init - eta_min) * (1 + math.cos(math.pi * iteration / total_iterations)) / 2
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
