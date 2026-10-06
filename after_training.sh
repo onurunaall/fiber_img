@@ -6,9 +6,8 @@
 #     bash /workspace/tu_dresden/after_training.sh --no-optional   # skip torch.compile and TensorRT
 #     bash /workspace/tu_dresden/after_training.sh --no-sgarnet    # only the UNet, no SGARNet results
 #
-# Expects the UNet checkpoints in $CKPT_DIR and the SGARNet checkpoints in $SGARNET_CKPT_DIR, e.g. from
-#     python train.py --arch sgarnet --save_path /workspace/checkpoints_sgarnet \
-#         --sgarnet_lattice_period P --sgarnet_lattice_angle A ...   (P, A from estimate_lattice_period.py)
+# Expects the UNet checkpoints in $CKPT_DIR and the SGARNet checkpoints in $SGARNET_CKPT_DIR,
+# as written by run_training.sh.
 #
 # Safe steps (always run, the script stops at the first error):
 #     baseline + UNet and SGARNet scores, prediction images, U-Net vs SGARNet comparison images,
@@ -179,6 +178,12 @@ if [ "$RUN_SGARNET" -eq 1 ]; then
     fi
     cp "$SG_BEST" "$OUT_DIR/sgarnet_$(basename "$SG_BEST")"
     cp "$SG_LAST" "$OUT_DIR/sgarnet_$(basename "$SG_LAST")"
+    # Written by run_training.sh when it measured the lattice
+    for file in lattice_estimate.txt lattice_spectrum.png; do
+        if [ -f "$SGARNET_CKPT_DIR/$file" ]; then
+            cp "$SGARNET_CKPT_DIR/$file" "$OUT_DIR/sgarnet_$file"
+        fi
+    done
 fi
 
 step "2/11 Baseline (raw input vs target, no UNet)"
