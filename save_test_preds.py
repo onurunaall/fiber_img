@@ -9,7 +9,7 @@ from imageDatastore import imageDatastore
 from model_factory import load_trained_model
 from utils import tensor2np
 
-# Usage: python save_test_preds.py CHECKPOINT DIR_Z DIR_X OUT_DIR [ARCH]   (ARCH: unet (default) or sgarnet)
+# Usage: python save_test_preds.py CHECKPOINT DIR_Z DIR_X OUT_DIR [ARCH]   (ARCH: unet (default), unet_edsr or sgarnet)
 checkpoint_path, dir_z, dir_x, out_dir = sys.argv[1:5]
 architecture = sys.argv[5] if len(sys.argv) > 5 else "unet"
 os.makedirs(os.path.join(out_dir, "pred"), exist_ok=True)

@@ -7,17 +7,34 @@ import torch
 from torch import nn
 
 from model_SGARNet import SGARNet
-from model_UNET_EDSR import UNET
+from model_UNET_EDSR import UNET, UNET_EDSR
 from utils import load_checkpoint
 
 
 type ModelBuilder = Callable[..., nn.Module]
+
+# EDSR size of the commented-out UNET_EDSR line in the original train.py (n_resblocks=32, n_feats=256)
+EDSR_DEFAULT_RESBLOCKS = 32
+EDSR_DEFAULT_FEATS = 256
 
 COMPILE_MODES = ("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs")
 
 
 def build_unet(in_channels: int, out_channels: int) -> nn.Module:
     return UNET(in_channels=in_channels, out_channels=out_channels, inplace=False)
+
+
+def build_unet_edsr(in_channels: int, out_channels: int, n_resblocks: int, n_feats: int) -> nn.Module:
+    # UNet (input -> 8 channels) followed by an EDSR with scale 1, i.e. no upsampling: the output has the input size.
+    return UNET_EDSR(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        features=[32, 64, 128, 256],
+        n_resblocks=n_resblocks,
+        n_feats=n_feats,
+        scale=1,
+        inplace=False,
+    )
 
 
 def build_sgarnet(in_channels: int, out_channels: int, lattice_period_px: float, lattice_angle_deg: float) -> nn.Module:
@@ -45,6 +62,7 @@ def build_sgarnet(in_channels: int, out_channels: int, lattice_period_px: float,
 # To add an architecture: write a builder function and register it here under a new name.
 MODEL_BUILDERS: dict[str, ModelBuilder] = {
     "unet": build_unet,
+    "unet_edsr": build_unet_edsr,
     "sgarnet": build_sgarnet,
 }
 
@@ -58,6 +76,12 @@ def architecture_options(architecture: str, args: argparse.Namespace) -> dict[st
 
     Checkpoints store these arguments, so a loaded model gets the same settings it was trained with.
     """
+    if architecture == "unet_edsr":
+        return {
+            "n_resblocks": getattr(args, "edsr_n_resblocks", EDSR_DEFAULT_RESBLOCKS),
+            "n_feats": getattr(args, "edsr_n_feats", EDSR_DEFAULT_FEATS),
+        }
+
     if architecture != "sgarnet":
         return {}
 
