@@ -315,13 +315,11 @@ class UNET_EDSR(nn.Module):
         n_feats = n_feats
         scale = scale
         
-        # self.unet = UNET(in_channels=in_channels, out_channels=8, outScale=1, inplace=inplace)
-        
-        # unet new version
-        from models.model_unet import UNET as unet_256
-        self.unet = unet_256(in_channels=in_channels, out_channels=8, features=features, inplace=False)
-        
-        self.edsr = EDSR(in_channels=8, n_colors=1, n_resblocks=n_resblocks, n_feats=n_feats, scale=scale, rgb_range=1)
+        # The original used 'from models.model_unet import UNET as unet_256' here, a module that is not
+        # in this repo. The UNET of this file takes its place: same call, same 8-channel output.
+        self.unet = UNET(in_channels=in_channels, out_channels=8, features=features, outScale=1, inplace=False)
+
+        self.edsr = EDSR(in_channels=8, n_colors=out_channels, n_resblocks=n_resblocks, n_feats=n_feats, scale=scale, rgb_range=1)
         
     # @autocast()
     def forward(self, x):
