@@ -1,0 +1,35 @@
+# Plain UNet (no EDSR).   Run:  python train.py --config configs/unet.toml
+# Every key is a train.py option (python train.py --help). Command-line options override this file,
+# e.g.  python train.py --config configs/unet.toml --num_epochs 5
+
+arch = "unet"
+recipe = "unet"              # L1 loss, Adam, lr *= lr_DropFactor every lr_DropPeriod epochs
+
+# Data: Z = HR target, X = sim_MCF input. Height and width must be multiples of 16.
+dir_ZTrain = "/workspace/data/HR_Train"
+dir_XTrain = "/workspace/data/sim_MCF_Train"
+dir_ZValid = "/workspace/data/HR_Valid"
+dir_XValid = "/workspace/data/sim_MCF_Valid"
+n_colors = 1
+ext = ".png"
+
+# Training
+num_epochs = 50
+batch_size = 4               # global batch size, split across num_GPUs
+val_batch_size = 4
+lr = 1e-4
+lr_DropFactor = 0.5
+lr_DropPeriod = 10
+patch_size = 0               # 0: full images; N: random N x N crops (multiple of 16)
+augment = "none"             # "none", "flips" or "flips+rot90"
+seed = 1
+
+# Hardware
+num_GPUs = 1                 # 0: CPU, 1: one GPU, >1: DistributedDataParallel
+num_workers = 4              # data loading workers per GPU
+compile = false              # torch.compile
+
+# Output
+save_path = "/workspace/ckpt_unet"
+save_everyEpoch = 10
+valid_everyEpoch = 1
