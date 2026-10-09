@@ -12,6 +12,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 from tqdm import tqdm
 
+from config_file import parse_args_with_config
 from distributed_utils import (
     DistributedContext,
     cleanup_distributed,
@@ -119,7 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rgb_range", default=1, type=int, help="maxium value of RGB")
     parser.add_argument("--seed", default=1, type=int)
     parser.add_argument("--ext", default=".png", type=str)
-    return resolve_recipe(parser.parse_args())
+    return resolve_recipe(parse_args_with_config(parser))
 
 
 def resolve_recipe(args: argparse.Namespace) -> argparse.Namespace:
