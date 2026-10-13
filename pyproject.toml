@@ -1,5 +1,36 @@
 [project]
 name = "program"
 version = "0.1.0"
-requires-python = ">=3.14"
-dependencies = []
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "torch>=2.14,<2.15",
+    "torchvision>=0.29,<0.30",
+    "numpy",
+    "opencv-python-headless>=4.9,<5",
+    "scikit-image>=0.19",
+    "albumentations>=2.0,<3",
+    "matplotlib",
+    "tqdm",
+    "lpips",
+    "piq",
+    "pytorch-msssim",
+]
+
+[dependency-groups]
+export = ["onnx", "onnxscript"]
+viz = ["torchview"]
+
+[tool.uv]
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'win32'",
+]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126" }]
+torchvision = [{ index = "pytorch-cu126" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
