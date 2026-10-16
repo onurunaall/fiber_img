@@ -7,25 +7,30 @@ import torch.distributed as dist
 
 @dataclass(frozen=True)
 class DistributedContext:
+    """Rank, number of processes and device of the current training process."""
     rank: int
     world_size: int
     device: torch.device
 
     @property
     def is_distributed(self) -> bool:
+        """True when training runs in more than one process."""
         return self.world_size > 1
 
     @property
     def is_main_process(self) -> bool:
+        """True for the process with rank 0, which prints and saves checkpoints."""
         return self.rank == 0
 
 
 def single_process_context(use_cuda: bool) -> DistributedContext:
+    """Returns the context of a single process on GPU 0, or on the CPU without use_cuda."""
     device = torch.device("cuda", 0) if use_cuda else torch.device("cpu")
     return DistributedContext(rank=0, world_size=1, device=device)
 
 
 def find_free_port() -> int:
+    """Returns a TCP port on 127.0.0.1 that is free right now."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         port: int = sock.getsockname()[1]
@@ -55,16 +60,19 @@ def init_distributed(rank: int, world_size: int, port: int) -> DistributedContex
 
 
 def print_on_main(context: DistributedContext, message: str) -> None:
+    """Prints message in the main process only."""
     if context.is_main_process:
         print(message)
 
 
 def cleanup_distributed(context: DistributedContext) -> None:
+    """Leaves the process group, if training is distributed."""
     if context.is_distributed:
         dist.destroy_process_group()
 
 
 def per_process_batch_size(global_batch_size: int, world_size: int) -> int:
+    """Splits the global batch size evenly across the processes; raises if it does not divide."""
     if global_batch_size % world_size != 0:
         raise ValueError(
             f"Batch size {global_batch_size} must be divisible by the number of GPUs ({world_size})."
@@ -73,6 +81,7 @@ def per_process_batch_size(global_batch_size: int, world_size: int) -> int:
 
 
 def sum_across_processes(values: list[float], context: DistributedContext) -> list[float]:
+    """Returns the element-wise sum of values over all processes."""
     if not context.is_distributed:
         return values
 
@@ -82,5 +91,6 @@ def sum_across_processes(values: list[float], context: DistributedContext) -> li
 
 
 def mean_across_processes(value: float, context: DistributedContext) -> float:
+    """Returns the mean of value over all processes."""
     total = sum_across_processes([value], context)[0]
     return total / context.world_size
