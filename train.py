@@ -1,11 +1,12 @@
 import argparse
 import copy
 import datetime
+import math
 import os
 
 import torch
 import torch.multiprocessing as mp
-from matplotlib import pyplot as plt
+from matplotlib.figure import Figure
 from torch import nn, optim
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
@@ -44,7 +45,7 @@ from utils import (
     setup_seed,
     time_text,
 )
-from validation import ValidationTotals, accumulate_validation_totals, compute_validation_result
+from validation import ValidationResult, ValidationTotals, accumulate_validation_totals, compute_validation_result
 
 
 DEFAULT_DATA_PATH = r"C:\Users\onue687i\Documents\AirDent\TW Source Material\720"
@@ -114,13 +115,21 @@ def parse_args() -> argparse.Namespace:
     # Pre-train
     parser.add_argument("--pretrain", action="store_true", help="load pre-trained model")
     parser.add_argument("--dir_pretrain", default="", type=str, help="path1 to checkpoint")
-    parser.add_argument("--start-epoch", default=1, type=int, help="manual epoch number")
+    parser.add_argument("--start-epoch", default=None, type=int,
+                        help="first epoch to train (default: the epoch after the --pretrain checkpoint, otherwise 1)")
 
     parser.add_argument("--save_model_arch", action="store_true", help="save model architecture")
     parser.add_argument("--rgb_range", default=1, type=int, help="maxium value of RGB")
     parser.add_argument("--seed", default=1, type=int)
     parser.add_argument("--ext", default=".png", type=str)
-    return resolve_recipe(parse_args_with_config(parser))
+    args = resolve_recipe(parse_args_with_config(parser))
+
+    # Each GPU gets an equal share of every batch. Checked here, before the GPU processes start.
+    for name in ("batch_size", "val_batch_size"):
+        size = getattr(args, name)
+        if args.num_GPUs > 1 and size % args.num_GPUs != 0:
+            parser.error(f"--{name} {size} must be divisible by --num_GPUs {args.num_GPUs}")
+    return args
 
 
 def resolve_recipe(args: argparse.Namespace) -> argparse.Namespace:
@@ -296,7 +305,7 @@ def validate(
     loader: DataLoader,
     criterion: nn.Module,
     context: DistributedContext,
-) -> float:
+) -> ValidationResult:
     model.eval()
 
     local_totals = accumulate_validation_totals(model, loader, criterion, context.device)
@@ -307,7 +316,7 @@ def validate(
         context,
         f"Valid loss: {result.loss:.4f} \t\t PSNR: {result.psnr:.4f} \t\t SSIM: {result.ssim:.4f}",
     )
-    return result.loss
+    return result
 
 
 def create_optimizer(network: nn.Module, args: argparse.Namespace) -> optim.Optimizer:
@@ -328,11 +337,12 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> LossS
     model_arch = copy.deepcopy(network)
     network = network.to(context.device)
 
-    # Validation (and the choice of the _best checkpoint) always uses the L1 loss, so all recipes are compared alike.
+    # Validation (and the choice of the best checkpoint) always uses the L1 loss, so all recipes are compared alike.
     criterion = nn.L1Loss().to(context.device)
     training_criterion = SGARNetLoss().to(context.device) if args.recipe == "sgarnet" else criterion
     optimizer = create_optimizer(network, args)
     loss_stats: LossStats = {"train": [], "valid": [], "valid_expt": []}
+    start_epoch = 1 if args.start_epoch is None else args.start_epoch
 
     if args.pretrain:
         # weights_only=False: the file also stores 'args'. Only load checkpoint files you trust.
@@ -340,8 +350,19 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> LossS
         load_checkpoint(checkpoint, network)
         optimizer.load_state_dict(checkpoint["optimizer"])
         loss_stats = dict(checkpoint["loss_stats"])
+        if args.start_epoch is None:
+            start_epoch = checkpoint["epoch"] + 1
+            if start_epoch > args.num_epochs:
+                raise ValueError(
+                    f"{args.dir_pretrain} ends at epoch {checkpoint['epoch']}, so there is nothing left to train "
+                    f"up to --num_epochs {args.num_epochs}. Raise --num_epochs to train longer."
+                )
+        print_on_main(context, f"===> Starting at epoch {start_epoch} from {args.dir_pretrain}")
 
     loss_stats.setdefault("valid_epoch", list(range(1, len(loss_stats["valid"]) + 1)))
+    # Checkpoints from before PSNR and SSIM were saved get nan for their earlier validations.
+    for key in ("valid_psnr", "valid_ssim"):
+        loss_stats.setdefault(key, [math.nan] * len(loss_stats["valid"]))
     if args.recipe != "unet":
         loss_stats.setdefault("train_objective", [])
     best_valid_loss = min(loss_stats["valid"]) if loss_stats["valid"] else float("inf")
@@ -356,7 +377,7 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> LossS
     code_start = datetime.datetime.now()
     timer = Timer()
 
-    for epoch in range(args.start_epoch, args.num_epochs + 1):
+    for epoch in range(start_epoch, args.num_epochs + 1):
         epoch_start = timer.t()
 
         if train_sampler is not None:
@@ -371,22 +392,24 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> LossS
 
         do_valid = epoch % args.valid_everyEpoch == 0 or epoch == args.num_epochs
         if do_valid:
-            loss_valid = validate(validation_model, valid_loader, criterion, context)
-            loss_stats["valid"].append(loss_valid)
+            result = validate(validation_model, valid_loader, criterion, context)
+            loss_stats["valid"].append(result.loss)
+            loss_stats["valid_psnr"].append(float(result.psnr))
+            loss_stats["valid_ssim"].append(float(result.ssim))
             loss_stats["valid_epoch"].append(epoch)
 
-            # Save the best model now, only when it gets better
-            if loss_valid < best_valid_loss:
-                best_valid_loss = loss_valid
+            # Save the best model now, only when it gets better. It replaces the previous best.
+            if result.loss < best_valid_loss:
+                best_valid_loss = result.loss
                 if context.is_main_process:
-                    save_checkpoint(network, model_arch, optimizer, epoch, loss_stats, args, text="_best")
+                    save_checkpoint(network, model_arch, optimizer, epoch, loss_stats, args, "net_best.pth.tar")
 
         do_save = epoch % args.save_everyEpoch == 0 or epoch == args.num_epochs
         if do_save and context.is_main_process:
-            save_checkpoint(network, model_arch, optimizer, epoch, loss_stats, args)
+            save_checkpoint(network, model_arch, optimizer, epoch, loss_stats, args, f"net_epoch_{epoch}.pth.tar")
 
         epoch_end = timer.t()
-        progress = (epoch - args.start_epoch + 1) / (args.num_epochs - args.start_epoch + 1)
+        progress = (epoch - start_epoch + 1) / (args.num_epochs - start_epoch + 1)
         epoch_time = time_text(epoch_end - epoch_start)
         elapsed_time = time_text(epoch_end)
         expected_total_time = time_text(epoch_end / progress)
@@ -399,16 +422,22 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> LossS
     return loss_stats
 
 
-def plot_training_progress(loss_stats: LossStats) -> None:
-    plt.figure("Training progress", figsize=(10, 5))
-    plt.title("Training progress")
-    plt.plot(range(1, len(loss_stats["train"]) + 1), loss_stats["train"], label="Train")
-    plt.plot(loss_stats["valid_epoch"], loss_stats["valid"], label="Valid")
-    plt.xlabel("Epochs")
-    plt.ylabel("Loss")
-    plt.yscale("log")
-    plt.legend()
-    plt.show()
+def save_training_plot(loss_stats: LossStats, save_path: str) -> None:
+    """Saves the training and validation loss curves as training_progress.png in save_path."""
+    # A Figure without pyplot needs no screen and never waits for a window to be closed.
+    figure = Figure(figsize=(10, 5))
+    axes = figure.add_subplot()
+    axes.set_title("Training progress")
+    axes.plot(range(1, len(loss_stats["train"]) + 1), loss_stats["train"], label="Train")
+    axes.plot(loss_stats["valid_epoch"], loss_stats["valid"], label="Valid")
+    axes.set_xlabel("Epochs")
+    axes.set_ylabel("Loss")
+    axes.set_yscale("log")
+    axes.legend()
+
+    path = os.path.join(save_path, "training_progress.png")
+    figure.savefig(path)
+    print(f"Saved the training plot to {path}")
 
 
 def distributed_worker(rank: int, args: argparse.Namespace, port: int) -> None:
@@ -419,7 +448,7 @@ def distributed_worker(rank: int, args: argparse.Namespace, port: int) -> None:
         cleanup_distributed(context)
 
     if context.is_main_process:
-        plot_training_progress(loss_stats)
+        save_training_plot(loss_stats, args.save_path)
     torch.cuda.empty_cache()
 
 
@@ -452,7 +481,7 @@ def main() -> None:
 
     context = single_process_context(use_cuda=args.num_GPUs > 0)
     loss_stats = run_training(args, context)
-    plot_training_progress(loss_stats)
+    save_training_plot(loss_stats, args.save_path)
     torch.cuda.empty_cache()
 
 
