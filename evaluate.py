@@ -12,6 +12,7 @@ from validation import Predictor, accumulate_validation_totals, compute_validati
 
 
 def parse_args() -> argparse.Namespace:
+    """Parses the command-line options of evaluate.py."""
     parser = argparse.ArgumentParser(
         description="Evaluate a checkpoint (PyTorch) or a TensorRT engine on the validation set."
     )
@@ -37,6 +38,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_predictor(args: argparse.Namespace, device: torch.device) -> Predictor:
+    """Loads the TensorRT engine or the PyTorch checkpoint given on the command line."""
     if args.engine is not None:
         # Imported here so that evaluating a PyTorch checkpoint does not require TensorRT.
         from tensorrt_engine import TensorRTModel
@@ -50,6 +52,7 @@ def load_predictor(args: argparse.Namespace, device: torch.device) -> Predictor:
 
 
 def synchronize(device: torch.device) -> None:
+    """Waits until all queued GPU work on device has finished; does nothing on the CPU."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
@@ -60,6 +63,7 @@ def measure_latency_ms(
     warmup_iterations: int,
     timed_iterations: int,
 ) -> float:
+    """Returns the mean time of one prediction on inputs in milliseconds, after warm-up runs."""
     with torch.no_grad():
         for _ in range(warmup_iterations):
             predict(inputs)
@@ -75,6 +79,7 @@ def measure_latency_ms(
 
 
 def main() -> None:
+    """Prints the validation loss, PSNR, SSIM and latency of a checkpoint or engine."""
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")

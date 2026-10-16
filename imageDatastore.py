@@ -1,15 +1,19 @@
+import torch
 import torch.utils.data as data
 import os
 import re
 import cv2
 import numpy as np
+import numpy.typing as npt
+from typing import Any
 from lib import common
 
 
 IMG_EXTENSIONS = ['.png', '.npy', ]
 
 
-def default_loader(path, n_colors):
+def default_loader(path: str, n_colors: int) -> npt.NDArray[Any]:
+    """Reads an image file unchanged; with n_colors 3, converts it from BGR to RGB."""
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     assert img is not None, 'cv2 could not read the image: %s' % path
     if n_colors == 3:
@@ -19,14 +23,17 @@ def default_loader(path, n_colors):
         # grayscale image
         return img
 
-def npy_loader(path):
+def npy_loader(path: str) -> npt.NDArray[Any]:
+    """Reads an image saved as a .npy file."""
     return np.load(path)
 
-def is_image_file(filename):
+def is_image_file(filename: str) -> bool:
+    """True if filename has one of the IMG_EXTENSIONS."""
     return any(filename.lower().endswith(extension) for extension in IMG_EXTENSIONS)
 
 
-def make_dataset(dir):
+def make_dataset(dir: str) -> list[str]:
+    """Returns the paths of all image files in dir and its subfolders."""
     images = []
     assert os.path.isdir(dir), '%s is not a valid directory' % dir
 
@@ -37,20 +44,22 @@ def make_dataset(dir):
                 images.append(path)
     return images
 
-class imageDatastore(data.Dataset):
-    def __init__(self, 
-                 dir_Z,
-                 dir_X, 
-                 patches=False,
-                 patch_size=256, 
-                 n_colors=1, 
-                 rgb_range=1, 
-                 augment=False, 
-                 hflip=False, 
-                 vflip=False, 
-                 rotate=False,
-                 ext=".png"):
-        
+class imageDatastore(data.Dataset[tuple[torch.Tensor, torch.Tensor]]):
+    """Pairs of input (X) and target (Z) images, read from two folders, as (X, Z) tensors."""
+    def __init__(self,
+                 dir_Z: str,
+                 dir_X: str,
+                 patches: bool = False,
+                 patch_size: int = 256,
+                 n_colors: int = 1,
+                 rgb_range: float = 1,
+                 augment: bool = False,
+                 hflip: bool = False,
+                 vflip: bool = False,
+                 rotate: bool = False,
+                 ext: str = ".png") -> None:
+        """Lists the image pairs and checks that file i of dir_X matches file i of dir_Z."""
+
         self.dir_Z = dir_Z
         self.dir_X = dir_X
         self.patches = patches
@@ -73,7 +82,8 @@ class imageDatastore(data.Dataset):
         self.num_train = len(self.list_Z)
         self._check_pairs()
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns pair idx as (X, Z) tensors, cropped and augmented as configured."""
         X, Z = self._load_file(idx)
         
         X, Z = common.set_channel(X, Z, n_channels=self.n_colors)
@@ -83,19 +93,22 @@ class imageDatastore(data.Dataset):
         X_tensor, Z_tensor = common.np2Tensor(X, Z, rgb_range=self.rgb_range)
         return X_tensor, Z_tensor
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Returns the number of image pairs."""
         return self.num_train * self.repeat
 
-    def _get_index(self, idx):
+    def _get_index(self, idx: int) -> int:
+        """Maps a dataset index to a file index."""
         return idx % self.num_train
-    
-    def _scan(self):
+
+    def _scan(self) -> tuple[list[str], list[str]]:
+        """Returns the sorted image paths of dir_Z and dir_X."""
         list_Z = sorted(make_dataset(self.dir_Z))
         list_X = sorted(make_dataset(self.dir_X))
         return list_Z, list_X
 
-    # Check that X file number i and Z file number i show the same image
-    def _check_pairs(self):
+    def _check_pairs(self) -> None:
+        """Checks that X file number i and Z file number i show the same image."""
         assert len(self.list_X) == len(self.list_Z), \
             'X has %d files but Z has %d files' % (len(self.list_X), len(self.list_Z))
         for path_X, path_Z in zip(self.list_X, self.list_Z):
@@ -103,8 +116,10 @@ class imageDatastore(data.Dataset):
             num_Z = re.findall(r'\d+', os.path.basename(path_Z))
             assert num_X == num_Z, 'Pair mismatch: %s <-> %s' % (path_X, path_Z)
     
-    # Split patches for training
-    def _get_patch(self, imgX, imgZ):
+    def _get_patch(
+        self, imgX: npt.NDArray[Any], imgZ: npt.NDArray[Any]
+    ) -> tuple[npt.NDArray[Any], npt.NDArray[Any]]:
+        """Cuts the same random patch from both images when patches is on."""
         scale = self.scale
         if self.patches:
             imgX, imgZ = common.get_patch(imgX, imgZ, patch_size=self.patch_size, scale=scale)
@@ -115,12 +130,16 @@ class imageDatastore(data.Dataset):
             imgZ = imgZ[0:ih * scale, 0:iw * scale, :]
         return imgX, imgZ
 
-    def _augment_data(self, imgX, imgZ):
+    def _augment_data(
+        self, imgX: npt.NDArray[Any], imgZ: npt.NDArray[Any]
+    ) -> tuple[npt.NDArray[Any], npt.NDArray[Any]]:
+        """Applies the same random flips and rotation to both images when augmentation is on."""
         if self.augment:
             imgX, imgZ = common.augment(imgX, imgZ, hflip=self.hflip, vflip=self.vflip, rot=self.rotate)
         return imgX, imgZ
 
-    def _load_file(self, idx):
+    def _load_file(self, idx: int) -> tuple[npt.NDArray[Any], npt.NDArray[Any]]:
+        """Reads image pair idx as (X, Z) arrays."""
         idx = self._get_index(idx)
         if self.ext == '.npy':
             X = npy_loader(self.list_X[idx])
