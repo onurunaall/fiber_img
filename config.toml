@@ -1,0 +1,56 @@
+# train.py settings.   Run:  python train.py --config config.toml
+# Every key is a train.py option (python train.py --help). Command-line options override this file,
+# e.g.  python train.py --config config.toml --arch unet_edsr --num_epochs 5
+#
+# Top-level keys apply to every architecture. The [unet], [unet_edsr] and [sgarnet] tables below
+# apply only to that architecture and override the top-level keys.
+
+arch = "unet"                # unet, unet_edsr or sgarnet
+
+# Data: Z = HR target, X = sim_MCF input. Height and width must be multiples of 16.
+dir_ZTrain = "/workspace/data/HR_Train"
+dir_XTrain = "/workspace/data/sim_MCF_Train"
+dir_ZValid = "/workspace/data/HR_Valid"
+dir_XValid = "/workspace/data/sim_MCF_Valid"
+n_colors = 1
+ext = ".png"
+
+# Training. The recipe follows arch (unet_edsr uses the unet recipe). Left out here, lr, batch_size,
+# patch_size and augment get the recipe's default; set them in a table below to change them:
+#   unet recipe:    lr 1e-4, batch_size 4, patch_size 0 (full images), augment "none"
+#   sgarnet recipe: lr 1e-3, batch_size 8, patch_size 368, augment "flips+rot90"
+num_epochs = 50
+val_batch_size = 4           # global batch size, split across num_GPUs
+lr_DropFactor = 0.5          # unet recipe: lr *= lr_DropFactor every lr_DropPeriod epochs
+lr_DropPeriod = 10
+seed = 1
+
+# Hardware
+num_GPUs = 1                 # 0: CPU, 1: one GPU, >1: DistributedDataParallel
+num_workers = 4              # data loading workers per GPU
+compile = false              # torch.compile
+
+# Output
+save_everyEpoch = 10
+valid_everyEpoch = 1
+
+
+[unet]
+save_path = "/workspace/ckpt_unet"
+
+
+[unet_edsr]
+# GPU memory: training keeps about 68 KB per pixel per image with 32 blocks x 256 features
+# (e.g. 720 x 720 images: about 33 GiB per image in the batch). To fit a smaller GPU, lower
+# batch_size, train on crops (patch_size), or use a smaller EDSR (16 blocks x 64 features: about 9.5 KB per pixel).
+edsr_n_resblocks = 32
+edsr_n_feats = 256
+val_batch_size = 1           # validation always uses full images
+save_path = "/workspace/ckpt_unet_edsr"
+
+
+[sgarnet]
+# Required for sgarnet: measure them with estimate_lattice_period.py on the training inputs.
+# sgarnet_lattice_period = 0.0
+# sgarnet_lattice_angle = 0.0
+save_path = "/workspace/ckpt_sgarnet"

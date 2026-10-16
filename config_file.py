@@ -1,66 +1,46 @@
-"""Reads train.py options from a TOML file (see configs/).
+"""Reads train.py options from a TOML file (see config.toml).
 
-Each key of the file is a train.py option name without the leading dashes, e.g. num_epochs = 50.
-The values go through argparse like typed options, so types and choices are checked the same way,
-and options given on the command line override the file.
+Top-level keys are train.py option names (python train.py --help), e.g. num_epochs = 50.
+A table named after an architecture, e.g. [unet_edsr], holds options used only when that
+architecture is trained; they override the top-level keys. The file's options become argparse
+defaults, so the command line overrides them, e.g. --arch sgarnet switches the architecture.
 """
 import argparse
-import sys
 import tomllib
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
-
-
-def _option_actions(parser: argparse.ArgumentParser) -> dict[str, argparse.Action]:
-    """Option actions by name: both the dest (start_epoch) and the flag without dashes (start-epoch)."""
-    actions: dict[str, argparse.Action] = {}
-    for action in parser._actions:
-        if not action.option_strings or isinstance(action, argparse._HelpAction):
-            continue
-        actions[action.dest] = action
-        for option in action.option_strings:
-            actions[option.lstrip("-")] = action
-    return actions
-
-
-def _config_tokens(parser: argparse.ArgumentParser, config: dict[str, Any], path: Path) -> list[str]:
-    actions = _option_actions(parser)
-    tokens: list[str] = []
-    for key, value in config.items():
-        action = actions.get(key)
-        if action is None or action.dest == "config":
-            known = ", ".join(sorted(a.dest for a in set(actions.values()) if a.dest != "config"))
-            parser.error(f"unknown option '{key}' in {path}. Known options: {known}")
-
-        flag = action.option_strings[-1]
-        if isinstance(action, argparse._StoreTrueAction):
-            if not isinstance(value, bool):
-                parser.error(f"'{key}' in {path} must be true or false, got {value!r}")
-            if value:
-                tokens.append(flag)
-        elif isinstance(value, (bool, dict, list)):
-            parser.error(f"'{key}' in {path} must be a single number or string, got {value!r}")
-        else:
-            tokens += [flag, str(value)]
-    return tokens
 
 
 def parse_args_with_config(parser: argparse.ArgumentParser, argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """Parses --config FILE first, then the file's options, then the command line (the command line wins)."""
     parser.add_argument("--config", type=Path, default=None,
-                        help="TOML file with options (see configs/); command-line options override it")
+                        help="TOML file with options (see config.toml); command-line options override it")
+    path = parser.parse_args(argv).config
+    if path is None:
+        return parser.parse_args(argv)
+    if not path.is_file():
+        parser.error(f"config file not found: {path}")
 
-    pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument("--config", type=Path, default=None)
-    known, _ = pre_parser.parse_known_args(argv)
+    with open(path, "rb") as file:
+        config = tomllib.load(file)
+    tables = {name: config.pop(name) for name in list(config) if isinstance(config[name], dict)}
 
-    tokens: list[str] = []
-    if known.config is not None:
-        if not known.config.is_file():
-            parser.error(f"config file not found: {known.config}")
-        with open(known.config, "rb") as file:
-            tokens = _config_tokens(parser, tomllib.load(file), known.config)
+    actions = {action.dest: action for action in parser._actions if action.dest not in ("help", "config")}
+    architectures = actions["arch"].choices
+    for name, options in [("", config), *tables.items()]:
+        if name and name not in architectures:
+            parser.error(f"unknown table [{name}] in {path}. Tables must be architectures: {', '.join(architectures)}")
+        for key in options:
+            if key not in actions:
+                parser.error(f"unknown option '{key}' in {path}. Known options: {', '.join(sorted(actions))}")
 
-    command_line = list(argv) if argv is not None else sys.argv[1:]
-    return parser.parse_args(tokens + command_line)
+    parser.set_defaults(**config)
+    arch = parser.parse_args(argv).arch
+    parser.set_defaults(**tables.get(arch, {}))
+    args = parser.parse_args(argv)
+
+    # argparse checks choices only for command-line values, so check the file's values here.
+    for key in {**config, **tables.get(arch, {})}:
+        value, choices = getattr(args, key), actions[key].choices
+        if choices is not None and value not in choices:
+            parser.error(f"'{key}' in {path} must be one of {', '.join(map(str, choices))}, got {value!r}")
+    return args
