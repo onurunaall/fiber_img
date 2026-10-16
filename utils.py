@@ -59,10 +59,10 @@ def save_checkpoint(
     epoch: int,
     loss_stats: dict[str, list[float]],
     args: argparse.Namespace,
-    text: str = '',
+    file_name: str,
 ) -> None:
-    """Saves the model weights, optimizer state, loss history and arguments to args.save_path."""
-    print("=> Saving checkpoint")
+    """Saves the model weights, optimizer state, loss history and arguments as file_name in args.save_path."""
+    print(f"=> Saving checkpoint {file_name}")
     # checkpoint = {"state_dict": model.state_dict(), "optimizer": optimizer.state_dict(),}
     checkpoint: dict[str, Any] = {
         "state_dict": unwrap_module(model).state_dict(), 
@@ -75,7 +75,11 @@ def save_checkpoint(
     if args.save_model_arch:
         checkpoint.update({"model_arch": model_arch})
 
-    torch.save(checkpoint, os.path.join(args.save_path, "net_epoch_{}".format(epoch) + text + ".pth.tar"))
+    # Written to a temporary file first, so an interrupted save never leaves a broken file behind
+    # (net_best.pth.tar is overwritten every time validation improves).
+    path = os.path.join(args.save_path, file_name)
+    torch.save(checkpoint, path + ".tmp")
+    os.replace(path + ".tmp", path)
     # np.savez(args.save_path + "net_epoch_{}_info.npz".format(epoch), loss_stats=loss_stats, num_epochs=epoch, args=args)
 
 
