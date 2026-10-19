@@ -181,7 +181,8 @@ class UpBlock(nn.Module):
 
 
 class UNET(nn.Module):
-    def __init__(self, in_channels=1, out_channels=1, features=[32, 64, 128, 256], outScale=1, inplace=False):
+    def __init__(self, in_channels=1, out_channels=1, features=[32, 64, 128, 256], outScale=1, inplace=False,
+                 full_size_skip=False):
         super(UNET, self).__init__()
 
         if outScale not in (1, 2):
@@ -212,8 +213,12 @@ class UNET(nn.Module):
             self.unetDecoder.append(UpBlock(revFeats[2], revFeats[3], kernel_size=3, inplace=inplace))
             ConvOut_in = revFeats[3]
             if outScale == 1:
-                self.unetDecoder.append(UpBlock(revFeats[3], out_channels=out_channels, kernel_size=3, inplace=inplace))
-                ConvOut_in = out_channels
+                # full_size_skip: end with ConvIn's 8 channels instead of out_channels, so ConvIn's output can be added back.
+                last_channels = 8 if full_size_skip else out_channels
+                self.unetDecoder.append(UpBlock(revFeats[3], out_channels=last_channels, kernel_size=3, inplace=inplace))
+                ConvOut_in = last_channels
+        # Only outScale 1 ends at full size, where ConvIn's output fits.
+        self.full_size_skip = full_size_skip and outScale == 1
         
         # Conv out
         self.ConvOut = nn.Conv2d(ConvOut_in, out_channels, kernel_size=3, padding='same', bias=True)
@@ -228,6 +233,7 @@ class UNET(nn.Module):
         skip_connects = []
         
         x = self.ConvIn(x)
+        full_size = x   # the only full-size view of the input, added back before ConvOut with full_size_skip
         
         for downblock in self.unetEncoder:
             x = downblock(x)
@@ -242,6 +248,8 @@ class UNET(nn.Module):
             x = torch.add(x, skip_connects[ii])
             
         x = self.unetDecoder[-1](x)
+        if self.full_size_skip:
+            x = torch.add(x, full_size)
         return self.ConvOut(x)
             
 
@@ -300,7 +308,7 @@ class EDSR(nn.Module):
 
 class UNET_EDSR(nn.Module):
     def __init__(self, in_channels=1, out_channels=1, features=[32, 64, 128, 256], n_resblocks=32, n_feats=256, scale=1, 
-                 n_colors=1, rgb_range=1, inplace=True):
+                 n_colors=1, rgb_range=1, inplace=True, full_size_skip=False):
         super(UNET_EDSR, self).__init__()
 
         in_channels = in_channels
@@ -317,7 +325,9 @@ class UNET_EDSR(nn.Module):
         
         # The original used 'from models.model_unet import UNET as unet_256' here, a module that is not
         # in this repo. The UNET of this file takes its place: same call, same 8-channel output.
-        self.unet = UNET(in_channels=in_channels, out_channels=8, features=features, outScale=1, inplace=False)
+        # full_size_skip: the UNet of unet_v2, which adds ConvIn's output back at full size.
+        self.unet = UNET(in_channels=in_channels, out_channels=8, features=features, outScale=1, inplace=False,
+                         full_size_skip=full_size_skip)
 
         self.edsr = EDSR(in_channels=8, n_colors=out_channels, n_resblocks=n_resblocks, n_feats=n_feats, scale=scale, rgb_range=1)
         

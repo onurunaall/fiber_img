@@ -54,7 +54,7 @@ DEFAULT_DATA_PATH = r"C:\Users\onue687i\Documents\AirDent\TW Source Material\720
 type LossStats = dict[str, list[float]]
 
 # Training recipes:
-#   unet:    (also used for --arch unet_edsr) L1 loss, Adam, step decay (lr_DropFactor every lr_DropPeriod epochs), full images, no augmentation.
+#   unet:    (also used for --arch unet_v2, unet_edsr and unet_v2_edsr) L1 loss, Adam, step decay (lr_DropFactor every lr_DropPeriod epochs), full images, no augmentation.
 #   sgarnet: options/train/MCFArtifactFree.yml of https://github.com/THUHoloLab/SGARNet: PSNR loss
 #            + 0.01 * VGG19 perceptual loss, AdamW, cosine decay per iteration, gradient clipping,
 #            random crops with flips and rot90.
@@ -104,9 +104,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sgarnet_lattice_angle", default=None, type=float,
                         help="SGARNet: core lattice angle in degrees, from estimate_lattice_period.py")
     parser.add_argument("--edsr_n_resblocks", default=EDSR_DEFAULT_RESBLOCKS, type=int,
-                        help="UNET_EDSR: number of EDSR residual blocks")
+                        help="unet_edsr and unet_v2_edsr: number of EDSR residual blocks")
     parser.add_argument("--edsr_n_feats", default=EDSR_DEFAULT_FEATS, type=int,
-                        help="UNET_EDSR: number of EDSR feature channels")
+                        help="unet_edsr and unet_v2_edsr: number of EDSR feature channels")
 
     # Dataset
     parser.add_argument("--dir_ZTrain", default=os.path.join(DEFAULT_DATA_PATH, "HR_Train"), type=str)

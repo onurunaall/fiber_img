@@ -24,6 +24,11 @@ def build_unet(in_channels: int, out_channels: int) -> nn.Module:
     return UNET(in_channels=in_channels, out_channels=out_channels, inplace=False)
 
 
+def build_unet_v2(in_channels: int, out_channels: int) -> nn.Module:
+    # The UNet with 8 channels instead of out_channels at full size, plus a skip connection at full size.
+    return UNET(in_channels=in_channels, out_channels=out_channels, inplace=False, full_size_skip=True)
+
+
 def build_unet_edsr(in_channels: int, out_channels: int, n_resblocks: int, n_feats: int) -> nn.Module:
     # UNet (input -> 8 channels) followed by an EDSR with scale 1, i.e. no upsampling: the output has the input size.
     return UNET_EDSR(
@@ -34,6 +39,20 @@ def build_unet_edsr(in_channels: int, out_channels: int, n_resblocks: int, n_fea
         n_feats=n_feats,
         scale=1,
         inplace=False,
+    )
+
+
+def build_unet_v2_edsr(in_channels: int, out_channels: int, n_resblocks: int, n_feats: int) -> nn.Module:
+    # unet_edsr with the UNet of unet_v2: its UNet adds ConvIn's output back at full size, before the EDSR.
+    return UNET_EDSR(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        features=[32, 64, 128, 256],
+        n_resblocks=n_resblocks,
+        n_feats=n_feats,
+        scale=1,
+        inplace=False,
+        full_size_skip=True,
     )
 
 
@@ -62,7 +81,9 @@ def build_sgarnet(in_channels: int, out_channels: int, lattice_period_px: float,
 # To add an architecture: write a builder function and register it here under a new name.
 MODEL_BUILDERS: dict[str, ModelBuilder] = {
     "unet": build_unet,
+    "unet_v2": build_unet_v2,
     "unet_edsr": build_unet_edsr,
+    "unet_v2_edsr": build_unet_v2_edsr,
     "sgarnet": build_sgarnet,
 }
 
@@ -76,7 +97,7 @@ def architecture_options(architecture: str, args: argparse.Namespace) -> dict[st
 
     Checkpoints store these arguments, so a loaded model gets the same settings it was trained with.
     """
-    if architecture == "unet_edsr":
+    if architecture in ("unet_edsr", "unet_v2_edsr"):
         return {
             "n_resblocks": getattr(args, "edsr_n_resblocks", EDSR_DEFAULT_RESBLOCKS),
             "n_feats": getattr(args, "edsr_n_feats", EDSR_DEFAULT_FEATS),

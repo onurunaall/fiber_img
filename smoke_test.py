@@ -2,8 +2,9 @@
 
 Run:  python smoke_test.py
 
-Covers unet and a small unet_edsr, the config file, resuming with --pretrain, the batch size check,
-the files a run writes and the run folders (a new run never touches an earlier run's files).
+Covers unet, unet_v2, a small unet_edsr and unet_v2_edsr, the config file, resuming with --pretrain,
+the batch size check, the files a run writes and the run folders (a new run never touches an earlier
+run's files).
 sgarnet is left out: its loss downloads the VGG19 weights (about 550 MB).
 """
 import subprocess
@@ -64,6 +65,7 @@ def main() -> None:
             f'dir_XValid = "{(root / "sim_MCF_Valid").as_posix()}"\n'
             "num_GPUs = 0\nnum_workers = 0\nbatch_size = 4\nval_batch_size = 2\nsave_everyEpoch = 1\n"
             "\n[unet_edsr]\nedsr_n_resblocks = 2\nedsr_n_feats = 16\n"
+            "\n[unet_v2_edsr]\nedsr_n_resblocks = 2\nedsr_n_feats = 16\n"
         )
 
         runs = root / "runs"
@@ -99,6 +101,17 @@ def main() -> None:
         assert edsr.name.endswith("_unet_edsr"), edsr.name
         assert {path.name: path.read_bytes() for path in unet.iterdir()} == unet_files, "a new run changed an earlier run's files"
         assert load_checkpoint(edsr / "net_epoch_1.pth.tar")["args"].edsr_n_feats == 16  # type: ignore[attr-defined]
+
+        # unet_v2 trains, and ends with 8 channels at full size (ConvOut: 8 -> 1 channels).
+        train_ok("--config", str(config), "--arch", "unet_v2", "--num_epochs", "1", "--save_path", str(runs))
+        [unet_v2] = [path for path in run_folders(runs) if path.name.endswith("_unet_v2")]
+        state = load_checkpoint(unet_v2 / "net_epoch_1.pth.tar")["state_dict"]
+        assert state["ConvOut.weight"].shape == (1, 8, 3, 3), state["ConvOut.weight"].shape  # type: ignore[index]
+
+        # unet_v2_edsr trains and gets the EDSR size of its [unet_v2_edsr] table.
+        train_ok("--config", str(config), "--arch", "unet_v2_edsr", "--num_epochs", "1", "--save_path", str(runs))
+        [unet_v2_edsr] = [path for path in run_folders(runs) if path.name.endswith("_unet_v2_edsr")]
+        assert load_checkpoint(unet_v2_edsr / "net_epoch_1.pth.tar")["args"].edsr_n_feats == 16  # type: ignore[attr-defined]
 
         # A batch size that does not split across the GPUs stops before any GPU process starts.
         run = train("--config", str(config), "--num_GPUs", "2", "--val_batch_size", "1", "--save_path", str(root / "x"))

@@ -2,10 +2,10 @@
 # Every key is a train.py option (python train.py --help). Command-line options override this file,
 # e.g.  python train.py --config config.toml --arch unet_edsr --num_epochs 5
 #
-# Top-level keys apply to every architecture. The [unet], [unet_edsr] and [sgarnet] tables below
-# apply only to that architecture and override the top-level keys.
+# Top-level keys apply to every architecture. The [unet], [unet_v2], [unet_edsr], [unet_v2_edsr] and
+# [sgarnet] tables below apply only to that architecture and override the top-level keys.
 
-arch = "unet"                # unet, unet_edsr or sgarnet
+arch = "unet"                # unet, unet_v2, unet_edsr, unet_v2_edsr or sgarnet
 
 # Data: Z = HR target, X = sim_MCF input. Height and width must be multiples of 16.
 dir_ZTrain = "/workspace/data/HR_Train"
@@ -15,8 +15,8 @@ dir_XValid = "/workspace/data/sim_MCF_Valid"
 n_colors = 1
 ext = ".png"
 
-# Training. The recipe follows arch (unet_edsr uses the unet recipe). Left out here, lr, batch_size,
-# patch_size and augment get the recipe's default; set them in a table below to change them:
+# Training. The recipe follows arch (every arch but sgarnet uses the unet recipe). Left out here, lr,
+# batch_size, patch_size and augment get the recipe's default; set them in a table below to change them:
 #   unet recipe:    lr 1e-4, batch_size 4, patch_size 0 (full images), augment "none"
 #   sgarnet recipe: lr 1e-3, batch_size 8, patch_size 368, augment "flips+rot90"
 num_epochs = 50
@@ -41,6 +41,11 @@ valid_everyEpoch = 1
 save_path = "/workspace/ckpt_unet"
 
 
+[unet_v2]
+# The unet with 8 channels and a skip connection at full image size.
+save_path = "/workspace/ckpt_unet_v2"
+
+
 [unet_edsr]
 # GPU memory: training keeps about 68 KB per pixel per image with 32 blocks x 256 features
 # (e.g. 720 x 720 images: about 33 GiB per image in the batch). To fit a smaller GPU, lower
@@ -49,6 +54,15 @@ edsr_n_resblocks = 32
 edsr_n_feats = 256
 val_batch_size = 1           # validation always uses full images
 save_path = "/workspace/ckpt_unet_edsr"
+
+
+[unet_v2_edsr]
+# unet_edsr with the UNet of unet_v2 (skip connection at full size). Same EDSR, so the same GPU memory
+# as unet_edsr (see above).
+edsr_n_resblocks = 32
+edsr_n_feats = 256
+val_batch_size = 1           # validation always uses full images
+save_path = "/workspace/ckpt_unet_v2_edsr"
 
 
 [sgarnet]
