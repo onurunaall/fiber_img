@@ -3,6 +3,7 @@ import copy
 import datetime
 import math
 import os
+import re
 
 import torch
 import torch.multiprocessing as mp
@@ -87,7 +88,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--augment", default=None, choices=["none", "flips", "flips+rot90"],
                         help="random flips / 90-degree rotations of the training images (default: unet none, sgarnet flips+rot90)")
     parser.add_argument("--save_everyEpoch", default=1, type=int)
-    parser.add_argument("--save_path", default="./folder/", type=str)
+    parser.add_argument("--save_path", default="./folder/", type=str,
+                        help="every new run saves its files in a new subfolder <date>_<time>_<arch> of this folder; "
+                             "--pretrain without --start-epoch continues in the folder of its checkpoint instead")
     parser.add_argument("--valid_everyEpoch", default=1, type=int)
     parser.add_argument("--num_workers", default=8, type=int, help="data loading workers per GPU")
     parser.add_argument("--num_GPUs", default=1, type=int, help="0: CPU, 1: one GPU, >1: DistributedDataParallel")
@@ -123,6 +126,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", default=1, type=int)
     parser.add_argument("--ext", default=".png", type=str)
     args = resolve_recipe(parse_args_with_config(parser))
+
+    # Checked here: a resumed run saves its files in the folder of this checkpoint.
+    if args.pretrain and not os.path.isfile(args.dir_pretrain):
+        parser.error(f"--dir_pretrain '{args.dir_pretrain}' is not a checkpoint file")
 
     # Each GPU gets an equal share of every batch. Checked here, before the GPU processes start.
     for name in ("batch_size", "val_batch_size"):
@@ -367,6 +374,24 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> LossS
         loss_stats.setdefault("train_objective", [])
     best_valid_loss = min(loss_stats["valid"]) if loss_stats["valid"] else float("inf")
 
+    # A resumed run continues in the folder of its checkpoint (a new run's folder is empty).
+    # Stop before overwriting checkpoints of later epochs, e.g. when resuming from an older checkpoint.
+    later_checkpoints = sorted(
+        name for name in os.listdir(args.save_path)
+        if (match := re.fullmatch(r"net_epoch_(\d+)\.pth\.tar", name)) and int(match.group(1)) >= start_epoch
+    )
+    if later_checkpoints:
+        raise ValueError(
+            f"{args.save_path} already has {', '.join(later_checkpoints)}, which training from epoch {start_epoch} "
+            "would overwrite. Resume from the last checkpoint, or add --start-epoch to train into a new folder."
+        )
+    # net_best.pth.tar can be newer than the resumed checkpoint (e.g. after a crash). Only a better model may replace it.
+    best_path = os.path.join(args.save_path, "net_best.pth.tar")
+    if os.path.isfile(best_path):
+        best_checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
+        best_valid_loss = min([best_valid_loss, *best_checkpoint["loss_stats"]["valid"]])
+        del best_checkpoint
+
     training_model, validation_model = prepare_models(network, args, context)
 
     print_on_main(
@@ -440,6 +465,14 @@ def save_training_plot(loss_stats: LossStats, save_path: str) -> None:
     print(f"Saved the training plot to {path}")
 
 
+def make_run_folder(save_path: str, arch: str) -> str:
+    """Makes a new, empty folder save_path/<date>_<time>_<arch> for the files of this run."""
+    run_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + f"_{arch}"
+    path = os.path.join(save_path, run_name)
+    os.makedirs(path)  # fails if the folder exists, so a run never writes into another run's folder
+    return path
+
+
 def distributed_worker(rank: int, args: argparse.Namespace, port: int) -> None:
     context = init_distributed(rank, args.num_GPUs, port)
     try:
@@ -468,8 +501,14 @@ def main() -> None:
     # Stop now, before any GPU process starts, if a setting of the architecture is missing.
     architecture_options(args.arch, args)
 
-    # Create the checkpoint folder if it does not exist yet
-    os.makedirs(args.save_path, exist_ok=True)
+    # Decided here, before any GPU process starts, so that all of them save into the same folder.
+    if args.pretrain and args.start_epoch is None:
+        # Resuming continues the same run, in the folder of its checkpoint.
+        args.save_path = os.path.dirname(os.path.abspath(args.dir_pretrain))
+    else:
+        # A new run gets a new folder, so it never overwrites the files of an earlier run.
+        args.save_path = make_run_folder(args.save_path, args.arch)
+    print(f"===> Saving the files of this run in {args.save_path}")
 
     if args.recipe == "sgarnet":
         # Download the VGG19 weights once here, so the GPU processes do not all download them at the same time.

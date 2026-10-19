@@ -30,7 +30,9 @@ num_GPUs = 1                 # 0: CPU, 1: one GPU, >1: DistributedDataParallel
 num_workers = 4              # data loading workers per GPU
 compile = false              # torch.compile
 
-# Output
+# Output. save_path (set per architecture below) is a parent folder: every new run saves its files
+# in a new subfolder there, named <date>_<time>_<arch>, e.g. 2026-10-19_14-30-05_unet. Resuming
+# with --pretrain (without --start-epoch) continues in the folder of its checkpoint.
 save_everyEpoch = 10
 valid_everyEpoch = 1
 

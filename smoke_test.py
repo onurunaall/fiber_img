@@ -2,8 +2,9 @@
 
 Run:  python smoke_test.py
 
-Covers unet and a small unet_edsr, the config file, resuming with --pretrain, the batch size check
-and the files a run writes. sgarnet is left out: its loss downloads the VGG19 weights (about 550 MB).
+Covers unet and a small unet_edsr, the config file, resuming with --pretrain, the batch size check,
+the files a run writes and the run folders (a new run never touches an earlier run's files).
+sgarnet is left out: its loss downloads the VGG19 weights (about 550 MB).
 """
 import subprocess
 import sys
@@ -43,6 +44,11 @@ def load_checkpoint(path: Path) -> dict[str, object]:
     return checkpoint
 
 
+def run_folders(parent: Path) -> list[Path]:
+    """Returns the run folders train.py made in parent, oldest first (their names start with date and time)."""
+    return sorted(path for path in parent.iterdir() if path.is_dir())
+
+
 def main() -> None:
     """Trains, resumes and checks the results; exits with an error message on the first failure."""
     with tempfile.TemporaryDirectory() as temp:
@@ -60,8 +66,10 @@ def main() -> None:
             "\n[unet_edsr]\nedsr_n_resblocks = 2\nedsr_n_feats = 16\n"
         )
 
-        unet = root / "unet"
-        train_ok("--config", str(config), "--arch", "unet", "--num_epochs", "2", "--save_path", str(unet))
+        runs = root / "runs"
+        train_ok("--config", str(config), "--arch", "unet", "--num_epochs", "2", "--save_path", str(runs))
+        [unet] = run_folders(runs)
+        assert unet.name.endswith("_unet"), unet.name
         stats = load_checkpoint(unet / "net_epoch_2.pth.tar")["loss_stats"]
         assert isinstance(stats, dict)
         assert len(stats["train"]) == 2 and stats["valid_epoch"] == [1, 2], stats
@@ -70,16 +78,26 @@ def main() -> None:
         assert not list(unet.glob("net_epoch_*_best.pth.tar")), "old-style _best checkpoints were written"
         assert (unet / "training_progress.png").is_file(), "no training_progress.png"
 
-        # Resuming continues after the checkpoint's epoch without --start-epoch.
-        train_ok("--config", str(config), "--arch", "unet", "--num_epochs", "3", "--save_path", str(unet),
-                 "--pretrain", "--dir_pretrain", str(unet / "net_epoch_2.pth.tar"))
+        # Resuming continues after the checkpoint's epoch without --start-epoch, in the checkpoint's folder.
+        resume = ("--config", str(config), "--arch", "unet", "--num_epochs", "3", "--save_path", str(runs),
+                  "--pretrain", "--dir_pretrain", str(unet / "net_epoch_2.pth.tar"))
+        train_ok(*resume)
+        assert run_folders(runs) == [unet], "resuming made a new run folder"
         checkpoint = load_checkpoint(unet / "net_epoch_3.pth.tar")
         stats = checkpoint["loss_stats"]
         assert isinstance(stats, dict)
         assert checkpoint["epoch"] == 3 and len(stats["train"]) == 3 and stats["valid_epoch"] == [1, 2, 3], stats
 
-        edsr = root / "unet_edsr"
-        train_ok("--config", str(config), "--arch", "unet_edsr", "--num_epochs", "1", "--save_path", str(edsr))
+        # Resuming from net_epoch_2 again would overwrite net_epoch_3, so it stops.
+        run = train(*resume)
+        assert run.returncode != 0 and "net_epoch_3.pth.tar" in run.stderr, run.stderr
+
+        # A new run gets its own folder and leaves the files of earlier runs alone.
+        unet_files = {path.name: path.read_bytes() for path in unet.iterdir()}
+        train_ok("--config", str(config), "--arch", "unet_edsr", "--num_epochs", "1", "--save_path", str(runs))
+        [_, edsr] = run_folders(runs)
+        assert edsr.name.endswith("_unet_edsr"), edsr.name
+        assert {path.name: path.read_bytes() for path in unet.iterdir()} == unet_files, "a new run changed an earlier run's files"
         assert load_checkpoint(edsr / "net_epoch_1.pth.tar")["args"].edsr_n_feats == 16  # type: ignore[attr-defined]
 
         # A batch size that does not split across the GPUs stops before any GPU process starts.
