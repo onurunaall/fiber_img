@@ -29,6 +29,7 @@ seed = 1
 num_GPUs = 1                 # 0: CPU, 1: one GPU, >1: DistributedDataParallel
 num_workers = 4              # data loading workers per GPU
 compile = false              # torch.compile
+amp = false                  # bfloat16 mixed precision: about half the GPU memory, faster (Ampere or newer GPU)
 
 # Output. save_path (set per architecture below) is a parent folder: every new run saves its files
 # in a new subfolder there, named <date>_<time>_<arch>, e.g. 2026-10-19_14-30-05_unet. Resuming
@@ -52,6 +53,7 @@ save_path = "/workspace/ckpt_unet_v2"
 # batch_size, train on crops (patch_size), or use a smaller EDSR (16 blocks x 64 features: about 9.5 KB per pixel).
 edsr_n_resblocks = 32
 edsr_n_feats = 256
+edsr_res_scale = 1.0          # the EDSR paper uses 0.1 for 32 x 256, to train stably
 val_batch_size = 1           # validation always uses full images
 save_path = "/workspace/ckpt_unet_edsr"
 
@@ -61,6 +63,7 @@ save_path = "/workspace/ckpt_unet_edsr"
 # as unet_edsr (see above).
 edsr_n_resblocks = 32
 edsr_n_feats = 256
+edsr_res_scale = 1.0          # the EDSR paper uses 0.1 for 32 x 256, to train stably
 val_batch_size = 1           # validation always uses full images
 save_path = "/workspace/ckpt_unet_v2_edsr"
 

@@ -99,6 +99,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arch", default="unet", choices=available_architectures())
     parser.add_argument("--compile", action="store_true", help="optimize the model with torch.compile")
     parser.add_argument("--compile_mode", default="default", choices=COMPILE_MODES)
+    parser.add_argument("--amp", action="store_true",
+                        help="train in bfloat16 mixed precision: about half the GPU memory and faster. Needs an "
+                             "Ampere or newer GPU (e.g. RTX A6000, A100). Validation stays in float32.")
     parser.add_argument("--sgarnet_lattice_period", default=None, type=float,
                         help="SGARNet: core lattice period in input pixels, from estimate_lattice_period.py")
     parser.add_argument("--sgarnet_lattice_angle", default=None, type=float,
@@ -107,6 +110,9 @@ def parse_args() -> argparse.Namespace:
                         help="unet_edsr and unet_v2_edsr: number of EDSR residual blocks")
     parser.add_argument("--edsr_n_feats", default=EDSR_DEFAULT_FEATS, type=int,
                         help="unet_edsr and unet_v2_edsr: number of EDSR feature channels")
+    parser.add_argument("--edsr_res_scale", default=1.0, type=float,
+                        help="unet_edsr and unet_v2_edsr: each EDSR block's output is multiplied by this before "
+                             "its skip is added (the EDSR paper uses 0.1 for 32 blocks x 256 features)")
 
     # Dataset
     parser.add_argument("--dir_ZTrain", default=os.path.join(DEFAULT_DATA_PATH, "HR_Train"), type=str)
@@ -278,8 +284,11 @@ def train_one_epoch(
         inputs = inputs.to(context.device)
         targets = targets.float().to(context.device)
 
-        predictions = model(inputs)
-        loss = criterion(predictions, targets)
+        # --amp: the forward pass runs in bfloat16 where it is safe (e.g. convolutions); the weights,
+        # their gradients and the optimizer stay float32. bfloat16 needs no gradient scaling.
+        with torch.autocast(context.device.type, dtype=torch.bfloat16, enabled=args.amp):
+            predictions = model(inputs)
+            loss = criterion(predictions, targets)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -292,7 +301,7 @@ def train_one_epoch(
             l1_value = loss_value
             progress.set_postfix(loss=loss_value)
         else:
-            l1_value = F.l1_loss(predictions.detach(), targets).item()
+            l1_value = F.l1_loss(predictions.detach().float(), targets).item()
             progress.set_postfix(loss=loss_value, l1=l1_value)
         total_loss += loss_value
         total_l1 += l1_value
@@ -333,6 +342,11 @@ def create_optimizer(network: nn.Module, args: argparse.Namespace) -> optim.Opti
 
 
 def run_training(args: argparse.Namespace, context: DistributedContext) -> LossStats:
+    if args.amp and context.device.type == "cuda" and not torch.cuda.is_bf16_supported(including_emulation=False):
+        raise ValueError(
+            f"--amp needs a GPU with bfloat16 support (Ampere or newer), "
+            f"but {torch.cuda.get_device_name(context.device)} has none. Train without --amp."
+        )
     setup_seed(args.seed + context.rank)
 
     train_loader, train_sampler = create_train_loader(args, context)
@@ -397,7 +411,8 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> LossS
     print_on_main(
         context,
         f"===> Training {args.arch} with the {args.recipe} recipe: lr {args.lr}, batch size {args.batch_size}, "
-        f"patch size {args.patch_size or 'full image'}, augment {args.augment}",
+        f"patch size {args.patch_size or 'full image'}, augment {args.augment}, "
+        f"bfloat16 mixed precision {'on' if args.amp else 'off'}",
     )
     code_start = datetime.datetime.now()
     timer = Timer()

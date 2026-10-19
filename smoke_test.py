@@ -2,7 +2,7 @@
 
 Run:  python smoke_test.py
 
-Covers unet, unet_v2, a small unet_edsr and unet_v2_edsr, the config file, resuming with --pretrain,
+Covers unet, unet_v2, a small unet_edsr and unet_v2_edsr, --amp, the config file, resuming with --pretrain,
 the batch size check, the files a run writes and the run folders (a new run never touches an earlier
 run's files).
 sgarnet is left out: its loss downloads the VGG19 weights (about 550 MB).
@@ -96,11 +96,14 @@ def main() -> None:
 
         # A new run gets its own folder and leaves the files of earlier runs alone.
         unet_files = {path.name: path.read_bytes() for path in unet.iterdir()}
-        train_ok("--config", str(config), "--arch", "unet_edsr", "--num_epochs", "1", "--save_path", str(runs))
+        # Also covers --amp (bfloat16 works on the CPU too) and --edsr_res_scale.
+        train_ok("--config", str(config), "--arch", "unet_edsr", "--num_epochs", "1", "--save_path", str(runs),
+                 "--amp", "--edsr_res_scale", "0.1")
         [_, edsr] = run_folders(runs)
         assert edsr.name.endswith("_unet_edsr"), edsr.name
         assert {path.name: path.read_bytes() for path in unet.iterdir()} == unet_files, "a new run changed an earlier run's files"
-        assert load_checkpoint(edsr / "net_epoch_1.pth.tar")["args"].edsr_n_feats == 16  # type: ignore[attr-defined]
+        edsr_args = load_checkpoint(edsr / "net_epoch_1.pth.tar")["args"]
+        assert edsr_args.edsr_n_feats == 16 and edsr_args.edsr_res_scale == 0.1 and edsr_args.amp, edsr_args  # type: ignore[attr-defined]
 
         # unet_v2 trains, and ends with 8 channels at full size (ConvOut: 8 -> 1 channels).
         train_ok("--config", str(config), "--arch", "unet_v2", "--num_epochs", "1", "--save_path", str(runs))

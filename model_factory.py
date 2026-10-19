@@ -29,7 +29,9 @@ def build_unet_v2(in_channels: int, out_channels: int) -> nn.Module:
     return UNET(in_channels=in_channels, out_channels=out_channels, inplace=False, full_size_skip=True)
 
 
-def build_unet_edsr(in_channels: int, out_channels: int, n_resblocks: int, n_feats: int) -> nn.Module:
+def build_unet_edsr(
+    in_channels: int, out_channels: int, n_resblocks: int, n_feats: int, res_scale: float = 1.0
+) -> nn.Module:
     # UNet (input -> 8 channels) followed by an EDSR with scale 1, i.e. no upsampling: the output has the input size.
     return UNET_EDSR(
         in_channels=in_channels,
@@ -39,10 +41,13 @@ def build_unet_edsr(in_channels: int, out_channels: int, n_resblocks: int, n_fea
         n_feats=n_feats,
         scale=1,
         inplace=False,
+        res_scale=res_scale,
     )
 
 
-def build_unet_v2_edsr(in_channels: int, out_channels: int, n_resblocks: int, n_feats: int) -> nn.Module:
+def build_unet_v2_edsr(
+    in_channels: int, out_channels: int, n_resblocks: int, n_feats: int, res_scale: float = 1.0
+) -> nn.Module:
     # unet_edsr with the UNet of unet_v2: its UNet adds ConvIn's output back at full size, before the EDSR.
     return UNET_EDSR(
         in_channels=in_channels,
@@ -53,6 +58,7 @@ def build_unet_v2_edsr(in_channels: int, out_channels: int, n_resblocks: int, n_
         scale=1,
         inplace=False,
         full_size_skip=True,
+        res_scale=res_scale,
     )
 
 
@@ -101,6 +107,8 @@ def architecture_options(architecture: str, args: argparse.Namespace) -> dict[st
         return {
             "n_resblocks": getattr(args, "edsr_n_resblocks", EDSR_DEFAULT_RESBLOCKS),
             "n_feats": getattr(args, "edsr_n_feats", EDSR_DEFAULT_FEATS),
+            # Checkpoints from before this option were trained with 1.0.
+            "res_scale": getattr(args, "edsr_res_scale", 1.0),
         }
 
     if architecture != "sgarnet":

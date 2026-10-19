@@ -254,7 +254,8 @@ class UNET(nn.Module):
             
 
 class EDSR(nn.Module):
-    def __init__(self, in_channels=1, n_colors=1, n_resblocks=32, n_feats=256, scale=2, conv=default_conv, rgb_range=1):
+    def __init__(self, in_channels=1, n_colors=1, n_resblocks=32, n_feats=256, scale=2, conv=default_conv, rgb_range=1,
+                 res_scale=1):
         super(EDSR, self).__init__()
         
         in_channels = in_channels
@@ -266,8 +267,9 @@ class EDSR(nn.Module):
         
         kernel_size = 3 
         act = nn.ReLU(True)
-        res_scale = 1
-         
+        # res_scale: each residual block's output is multiplied by it before the skip is added.
+        # The EDSR paper uses 0.1 for its 32 blocks x 256 features model, to train stably.
+
 
         # head module
         m_head = [conv(in_channels, n_feats, kernel_size)]
@@ -308,7 +310,7 @@ class EDSR(nn.Module):
 
 class UNET_EDSR(nn.Module):
     def __init__(self, in_channels=1, out_channels=1, features=[32, 64, 128, 256], n_resblocks=32, n_feats=256, scale=1, 
-                 n_colors=1, rgb_range=1, inplace=True, full_size_skip=False):
+                 n_colors=1, rgb_range=1, inplace=True, full_size_skip=False, res_scale=1):
         super(UNET_EDSR, self).__init__()
 
         in_channels = in_channels
@@ -329,7 +331,8 @@ class UNET_EDSR(nn.Module):
         self.unet = UNET(in_channels=in_channels, out_channels=8, features=features, outScale=1, inplace=False,
                          full_size_skip=full_size_skip)
 
-        self.edsr = EDSR(in_channels=8, n_colors=out_channels, n_resblocks=n_resblocks, n_feats=n_feats, scale=scale, rgb_range=1)
+        self.edsr = EDSR(in_channels=8, n_colors=out_channels, n_resblocks=n_resblocks, n_feats=n_feats, scale=scale, rgb_range=1,
+                         res_scale=res_scale)
         
     # @autocast()
     def forward(self, x):
