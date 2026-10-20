@@ -30,11 +30,8 @@ folder/
 # Exclude any tar archives and PyTorch checkpoint archives
 *.tar
 *.tar.gz
-*.pth
 *.pth.tar
 
 # Dataset directories (excludes all raw/training data images)
-dataset/
 data/
 datasets/
-checkpoints/

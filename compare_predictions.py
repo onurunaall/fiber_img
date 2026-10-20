@@ -3,10 +3,10 @@
 Usage:
     python compare_predictions.py DIR_Z DIR_X UNET_PRED_DIR SGARNET_PRED_DIR OUT_DIR
 Each OUT_DIR/<name>_compare.png shows, from left to right: sim_MCF input | U-Net | SGARNet | HR target,
-under a header row with these labels.
+under a header row with these labels. Grayscale images only.
 """
+import argparse
 import os
-import sys
 
 import cv2
 import numpy as np
@@ -42,7 +42,16 @@ def label_row(panel_width: int, dtype: np.dtype) -> np.ndarray:
 
 
 def main() -> None:
-    dir_z, dir_x, unet_pred_dir, sgarnet_pred_dir, out_dir = sys.argv[1:6]
+    parser = argparse.ArgumentParser(description="Put U-Net and SGARNet predictions side by side (grayscale images only).")
+    parser.add_argument("dir_z", help="folder of the HR targets")
+    parser.add_argument("dir_x", help="folder of the sim_MCF inputs")
+    parser.add_argument("unet_pred_dir", help="pred/ folder written by save_test_preds.py for the U-Net")
+    parser.add_argument("sgarnet_pred_dir", help="pred/ folder written by save_test_preds.py for SGARNet")
+    parser.add_argument("out_dir")
+    args = parser.parse_args()
+    dir_z, dir_x, unet_pred_dir, sgarnet_pred_dir, out_dir = (
+        args.dir_z, args.dir_x, args.unet_pred_dir, args.sgarnet_pred_dir, args.out_dir
+    )
     os.makedirs(out_dir, exist_ok=True)
     dataset = imageDatastore(dir_z, dir_x)
 

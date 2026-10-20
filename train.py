@@ -1,9 +1,10 @@
 import argparse
-import copy
 import datetime
 import math
 import os
 import re
+import sys
+import traceback
 
 import torch
 import torch.multiprocessing as mp
@@ -18,10 +19,9 @@ from config_file import parse_args_with_config
 from distributed_utils import (
     DistributedContext,
     cleanup_distributed,
-    find_free_port,
     init_distributed,
     mean_across_processes,
-    per_process_batch_size,
+    open_meeting_point,
     print_on_main,
     single_process_context,
     sum_across_processes,
@@ -49,7 +49,10 @@ from utils import (
 from validation import ValidationResult, ValidationTotals, accumulate_validation_totals, compute_validation_result
 
 
-DEFAULT_DATA_PATH = r"C:\Users\onue687i\Documents\AirDent\TW Source Material\720"
+DATA_FOLDERS = ("dir_ZTrain", "dir_XTrain", "dir_ZValid", "dir_XValid")
+# The progress bar shows the loss of every PROGRESS_EVERY-th batch. Reading a loss (.item()) makes the
+# CPU wait until the GPU has finished, so it is not done for every batch.
+PROGRESS_EVERY = 20
 
 type LossStats = dict[str, list[float]]
 
@@ -70,6 +73,11 @@ SGARNET_ETA_MIN = 1e-7
 SGARNET_GRAD_CLIP_NORM = 0.01
 
 
+def recipe_defaults_text(name: str) -> str:
+    """The default of option name in each recipe, e.g. 'unet 4, sgarnet 8', taken from RECIPE_DEFAULTS."""
+    return ", ".join(f"{recipe} {defaults[name]}" for recipe, defaults in RECIPE_DEFAULTS.items())
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="net")
 
@@ -78,21 +86,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recipe", default="auto", choices=["auto", *RECIPE_DEFAULTS],
                         help="training recipe; auto: sgarnet for --arch sgarnet, otherwise unet")
     parser.add_argument("--batch_size", default=None, type=int,
-                        help="global batch size, split across all GPUs (default: unet 4, sgarnet 8)")
+                        help=f"global batch size, split across all GPUs (default: {recipe_defaults_text('batch_size')})")
     parser.add_argument("--val_batch_size", default=4, type=int, help="global batch size, split across all GPUs")
-    parser.add_argument("--lr", default=None, type=float, help="initial learning rate (default: unet 1e-4, sgarnet 1e-3)")
+    parser.add_argument("--lr", default=None, type=float,
+                        help=f"initial learning rate (default: {recipe_defaults_text('lr')})")
     parser.add_argument("--lr_DropFactor", default=0.5, type=float, help="unet recipe only")
     parser.add_argument("--lr_DropPeriod", default=10, type=int, help="unet recipe only")
     parser.add_argument("--patch_size", default=None, type=int,
-                        help="train on random square crops of this size, 0: full images (default: unet 0, sgarnet 368)")
+                        help="train on random square crops of this size, 0: full images "
+                             f"(default: {recipe_defaults_text('patch_size')})")
     parser.add_argument("--augment", default=None, choices=["none", "flips", "flips+rot90"],
-                        help="random flips / 90-degree rotations of the training images (default: unet none, sgarnet flips+rot90)")
-    parser.add_argument("--save_everyEpoch", default=1, type=int)
+                        help="random flips / 90-degree rotations of the training images "
+                             f"(default: {recipe_defaults_text('augment')})")
+    parser.add_argument("--save_everyEpoch", default=10, type=int, help="save net_epoch_N.pth.tar every this many epochs")
     parser.add_argument("--save_path", default="./folder/", type=str,
                         help="every new run saves its files in a new subfolder <date>_<time>_<arch> of this folder; "
-                             "--pretrain without --start-epoch continues in the folder of its checkpoint instead")
+                             "--pretrain without --start_epoch continues in the folder of its checkpoint instead")
     parser.add_argument("--valid_everyEpoch", default=1, type=int)
-    parser.add_argument("--num_workers", default=8, type=int, help="data loading workers per GPU")
+    parser.add_argument("--num_workers", default=4, type=int, help="data loading workers per GPU")
     parser.add_argument("--num_GPUs", default=1, type=int, help="0: CPU, 1: one GPU, >1: DistributedDataParallel")
 
     # Model
@@ -114,24 +125,36 @@ def parse_args() -> argparse.Namespace:
                         help="unet_edsr and unet_v2_edsr: each EDSR block's output is multiplied by this before "
                              "its skip is added (the EDSR paper uses 0.1 for 32 blocks x 256 features)")
 
-    # Dataset
-    parser.add_argument("--dir_ZTrain", default=os.path.join(DEFAULT_DATA_PATH, "HR_Train"), type=str)
-    parser.add_argument("--dir_XTrain", default=os.path.join(DEFAULT_DATA_PATH, "sim_MCF_Train"), type=str)
-    parser.add_argument("--dir_ZValid", default=os.path.join(DEFAULT_DATA_PATH, "HR_Valid"), type=str)
-    parser.add_argument("--dir_XValid", default=os.path.join(DEFAULT_DATA_PATH, "sim_MCF_Valid"), type=str)
+    # Dataset. No defaults: set the folders in the config file or on the command line.
+    parser.add_argument("--dir_ZTrain", default=None, type=str, help="folder of the training targets (HR)")
+    parser.add_argument("--dir_XTrain", default=None, type=str, help="folder of the training inputs (sim_MCF)")
+    parser.add_argument("--dir_ZValid", default=None, type=str, help="folder of the validation targets (HR)")
+    parser.add_argument("--dir_XValid", default=None, type=str, help="folder of the validation inputs (sim_MCF)")
     parser.add_argument("--n_colors", default=1, type=int, help="number of color channels to use")
 
     # Pre-train
     parser.add_argument("--pretrain", action="store_true", help="load pre-trained model")
     parser.add_argument("--dir_pretrain", default="", type=str, help="path1 to checkpoint")
-    parser.add_argument("--start-epoch", default=None, type=int,
-                        help="first epoch to train (default: the epoch after the --pretrain checkpoint, otherwise 1)")
+    parser.add_argument("--start_epoch", "--start-epoch", default=None, type=int,
+                        help="first epoch to train (default: the epoch after the --pretrain checkpoint, otherwise 1). "
+                             "The old spelling --start-epoch also works.")
 
-    parser.add_argument("--save_model_arch", action="store_true", help="save model architecture")
+    parser.add_argument("--save_model_arch", action="store_true",
+                        help="also save the whole trained model object in every checkpoint")
     parser.add_argument("--rgb_range", default=1, type=int, help="maxium value of RGB")
     parser.add_argument("--seed", default=1, type=int)
     parser.add_argument("--ext", default=".png", type=str)
     args = resolve_recipe(parse_args_with_config(parser))
+
+    missing = [name for name in DATA_FOLDERS if getattr(args, name) is None]
+    if missing:
+        parser.error(f"no data folder given for {', '.join(missing)}: set it in the config file (--config) "
+                     f"or on the command line, e.g. --{missing[0]} FOLDER")
+
+    # Checked here: zero would crash later with "division by zero", in the middle of training.
+    for name in ("num_epochs", "valid_everyEpoch", "save_everyEpoch"):
+        if getattr(args, name) < 1:
+            parser.error(f"--{name} must be at least 1, got {getattr(args, name)}")
 
     # Checked here: a resumed run saves its files in the folder of this checkpoint.
     if args.pretrain and not os.path.isfile(args.dir_pretrain):
@@ -191,16 +214,22 @@ def create_train_loader(
             drop_last=True,
         )
 
+    # parse_args checked that the batch size splits evenly across the GPUs.
     loader = DataLoader(
         dataset,
-        batch_size=per_process_batch_size(args.batch_size, context.world_size),
+        batch_size=args.batch_size // context.world_size,
         shuffle=sampler is None,
         sampler=sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=context.device.type == "cuda",
         drop_last=True,
         persistent_workers=False,
     )
+    if len(loader) == 0:
+        raise ValueError(
+            f"{args.dir_XTrain} has {len(dataset)} training images, too few for one batch of "
+            f"--batch_size {args.batch_size}. Use a smaller --batch_size."
+        )
     return loader, sampler
 
 
@@ -219,10 +248,10 @@ def create_valid_loader(args: argparse.Namespace, context: DistributedContext) -
 
     return DataLoader(
         shard,
-        batch_size=per_process_batch_size(args.val_batch_size, context.world_size),
+        batch_size=args.val_batch_size // context.world_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=context.device.type == "cuda",
         drop_last=False,
     )
 
@@ -273,16 +302,18 @@ def train_one_epoch(
     print_on_main(context, f"\n------- Epoch {epoch}/{args.num_epochs} \t\t lr = {learning_rate}")
 
     progress = tqdm(loader, desc="In training", leave=True, ncols=80, disable=not context.is_main_process)
-    total_loss = 0.0
-    total_l1 = 0.0
+    # The sums stay on the GPU, so the CPU never has to wait for the GPU to add them up.
+    total_loss = torch.zeros((), device=context.device)
+    total_l1 = torch.zeros((), device=context.device)
 
     for batch_index, (inputs, targets) in enumerate(progress):
         if args.recipe == "sgarnet":
             # Like the original, the cosine learning rate changes every iteration.
             set_cosine_learning_rate(optimizer, first_iteration + batch_index, total_iterations, args.lr, SGARNET_ETA_MIN)
 
-        inputs = inputs.to(context.device)
-        targets = targets.float().to(context.device)
+        # non_blocking: the copy runs while the CPU already queues the next GPU work (the loader pins the memory).
+        inputs = inputs.to(context.device, non_blocking=True)
+        targets = targets.float().to(context.device, non_blocking=True)
 
         # --amp: the forward pass runs in bfloat16 where it is safe (e.g. convolutions); the weights,
         # their gradients and the optimizer stay float32. bfloat16 needs no gradient scaling.
@@ -296,22 +327,22 @@ def train_one_epoch(
             nn.utils.clip_grad_norm_(model.parameters(), SGARNET_GRAD_CLIP_NORM)
         optimizer.step()
 
-        loss_value = loss.item()
+        total_loss += loss.detach()
         if args.recipe == "unet":
-            l1_value = loss_value
-            progress.set_postfix(loss=loss_value)
+            if batch_index % PROGRESS_EVERY == 0:
+                progress.set_postfix(loss=loss.item())
         else:
-            l1_value = F.l1_loss(predictions.detach().float(), targets).item()
-            progress.set_postfix(loss=loss_value, l1=l1_value)
-        total_loss += loss_value
-        total_l1 += l1_value
+            l1 = F.l1_loss(predictions.detach().float(), targets)
+            total_l1 += l1
+            if batch_index % PROGRESS_EVERY == 0:
+                progress.set_postfix(loss=loss.item(), l1=l1.item())
 
-    epoch_loss = mean_across_processes(total_loss / len(loader), context)
+    epoch_loss = mean_across_processes(total_loss.item() / len(loader), context)
     if args.recipe == "unet":
         print_on_main(context, f"\nTrain loss: {epoch_loss:.4f}")
         return epoch_loss, epoch_loss
 
-    epoch_l1 = mean_across_processes(total_l1 / len(loader), context)
+    epoch_l1 = mean_across_processes(total_l1.item() / len(loader), context)
     print_on_main(context, f"\nTrain loss: {epoch_loss:.4f} \t\t Train L1: {epoch_l1:.4f}")
     return epoch_l1, epoch_loss
 
@@ -328,10 +359,7 @@ def validate(
     totals = ValidationTotals.from_list(sum_across_processes(local_totals.as_list(), context))
     result = compute_validation_result(totals)
 
-    print_on_main(
-        context,
-        f"Valid loss: {result.loss:.4f} \t\t PSNR: {result.psnr:.4f} \t\t SSIM: {result.ssim:.4f}",
-    )
+    print_on_main(context, result.text())
     return result
 
 
@@ -341,13 +369,15 @@ def create_optimizer(network: nn.Module, args: argparse.Namespace) -> optim.Opti
     return optim.Adam(network.parameters(), lr=args.lr)
 
 
-def run_training(args: argparse.Namespace, context: DistributedContext) -> LossStats:
+def run_training(args: argparse.Namespace, context: DistributedContext) -> None:
     if args.amp and context.device.type == "cuda" and not torch.cuda.is_bf16_supported(including_emulation=False):
         raise ValueError(
             f"--amp needs a GPU with bfloat16 support (Ampere or newer), "
             f"but {torch.cuda.get_device_name(context.device)} has none. Train without --amp."
         )
     setup_seed(args.seed + context.rank)
+    # All images of a run have the same size, so cuDNN can time its algorithms once and keep the fastest.
+    torch.backends.cudnn.benchmark = True
 
     train_loader, train_sampler = create_train_loader(args, context)
     valid_loader = create_valid_loader(args, context)
@@ -355,7 +385,6 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> LossS
     network = build_model(
         args.arch, in_channels=args.n_colors, out_channels=args.n_colors, **architecture_options(args.arch, args)
     )
-    model_arch = copy.deepcopy(network)
     network = network.to(context.device)
 
     # Validation (and the choice of the best checkpoint) always uses the L1 loss, so all recipes are compared alike.
@@ -397,12 +426,13 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> LossS
     if later_checkpoints:
         raise ValueError(
             f"{args.save_path} already has {', '.join(later_checkpoints)}, which training from epoch {start_epoch} "
-            "would overwrite. Resume from the last checkpoint, or add --start-epoch to train into a new folder."
+            "would overwrite. Resume from the last checkpoint, or add --start_epoch to train into a new folder."
         )
     # net_best.pth.tar can be newer than the resumed checkpoint (e.g. after a crash). Only a better model may replace it.
     best_path = os.path.join(args.save_path, "net_best.pth.tar")
     if os.path.isfile(best_path):
-        best_checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
+        # mmap: only the loss history is read from the disk, not the weights and the optimizer state.
+        best_checkpoint = torch.load(best_path, map_location="cpu", weights_only=False, mmap=True)
         best_valid_loss = min([best_valid_loss, *best_checkpoint["loss_stats"]["valid"]])
         del best_checkpoint
 
@@ -414,7 +444,6 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> LossS
         f"patch size {args.patch_size or 'full image'}, augment {args.augment}, "
         f"bfloat16 mixed precision {'on' if args.amp else 'off'}",
     )
-    code_start = datetime.datetime.now()
     timer = Timer()
 
     for epoch in range(start_epoch, args.num_epochs + 1):
@@ -442,11 +471,14 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> LossS
             if result.loss < best_valid_loss:
                 best_valid_loss = result.loss
                 if context.is_main_process:
-                    save_checkpoint(network, model_arch, optimizer, epoch, loss_stats, args, "net_best.pth.tar")
+                    save_checkpoint(network, optimizer, epoch, loss_stats, args, "net_best.pth.tar")
+            # Drawn after every validation, so a run that stops early still has its plot.
+            if context.is_main_process:
+                save_training_plot(loss_stats, args.save_path)
 
         do_save = epoch % args.save_everyEpoch == 0 or epoch == args.num_epochs
         if do_save and context.is_main_process:
-            save_checkpoint(network, model_arch, optimizer, epoch, loss_stats, args, f"net_epoch_{epoch}.pth.tar")
+            save_checkpoint(network, optimizer, epoch, loss_stats, args, f"net_epoch_{epoch}.pth.tar")
 
         epoch_end = timer.t()
         progress = (epoch - start_epoch + 1) / (args.num_epochs - start_epoch + 1)
@@ -455,11 +487,7 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> LossS
         expected_total_time = time_text(epoch_end / progress)
         print_on_main(context, f"Time cost: {epoch_time}, {elapsed_time}/{expected_total_time}")
 
-    code_end = datetime.datetime.now()
-    total_time = str(code_end - code_start).split(".", 2)[0]
-    print_on_main(context, f"Total cost times: {total_time}")
-
-    return loss_stats
+    print_on_main(context, f"Total cost times: {time_text(timer.t())}")
 
 
 def save_training_plot(loss_stats: LossStats, save_path: str) -> None:
@@ -474,10 +502,7 @@ def save_training_plot(loss_stats: LossStats, save_path: str) -> None:
     axes.set_ylabel("Loss")
     axes.set_yscale("log")
     axes.legend()
-
-    path = os.path.join(save_path, "training_progress.png")
-    figure.savefig(path)
-    print(f"Saved the training plot to {path}")
+    figure.savefig(os.path.join(save_path, "training_progress.png"))
 
 
 def make_run_folder(save_path: str, arch: str) -> str:
@@ -488,26 +513,55 @@ def make_run_folder(save_path: str, arch: str) -> str:
     return path
 
 
+class Tee:
+    """Writes everything printed to the screen and to a log file."""
+
+    def __init__(self, path: str) -> None:
+        self.screen = sys.stdout
+        self.file = open(path, "a", encoding="utf-8")
+
+    def write(self, text: str) -> int:
+        self.screen.write(text)
+        self.file.write(text)
+        self.file.flush()  # so the log is complete even if the run is killed
+        return len(text)
+
+    def flush(self) -> None:
+        self.screen.flush()
+        self.file.flush()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.screen, name)
+
+
+def log_to_file(save_path: str) -> Tee:
+    """From now on, everything this process prints also goes to save_path/train.log (a resumed run adds to it)."""
+    log = Tee(os.path.join(save_path, "train.log"))
+    sys.stdout = log
+    return log
+
+
 def distributed_worker(rank: int, args: argparse.Namespace, port: int) -> None:
+    if rank == 0:
+        log_to_file(args.save_path)
     context = init_distributed(rank, args.num_GPUs, port)
     try:
-        loss_stats = run_training(args, context)
+        run_training(args, context)
     finally:
         cleanup_distributed(context)
-
-    if context.is_main_process:
-        save_training_plot(loss_stats, args.save_path)
-    torch.cuda.empty_cache()
 
 
 def launch_distributed_training(args: argparse.Namespace) -> None:
     available_gpus = torch.cuda.device_count()
-    if args.num_GPUs > available_gpus:
+    if torch.cuda.is_available() and args.num_GPUs > available_gpus:
         raise ValueError(f"--num_GPUs is {args.num_GPUs}, but only {available_gpus} GPU(s) are available.")
+    if not torch.cuda.is_available():
+        print(f"===> No GPU found: running {args.num_GPUs} processes on the CPU (only useful for testing)")
 
-    # One process per GPU. Process number i (its "rank") trains on GPU i.
-    port = find_free_port()
-    mp.spawn(distributed_worker, args=(args, port), nprocs=args.num_GPUs)
+    # One process per GPU. Process number i (its "rank") trains on GPU i. The processes meet at a port
+    # that this process keeps open while they run, so no other program can take it in between.
+    meeting_point = open_meeting_point()
+    mp.spawn(distributed_worker, args=(args, meeting_point.port), nprocs=args.num_GPUs)
 
 
 def main() -> None:
@@ -523,20 +577,22 @@ def main() -> None:
     else:
         # A new run gets a new folder, so it never overwrites the files of an earlier run.
         args.save_path = make_run_folder(args.save_path, args.arch)
+    log = log_to_file(args.save_path)
     print(f"===> Saving the files of this run in {args.save_path}")
 
-    if args.recipe == "sgarnet":
-        # Download the VGG19 weights once here, so the GPU processes do not all download them at the same time.
-        load_vgg19_weights()
+    try:
+        if args.recipe == "sgarnet":
+            # Download the VGG19 weights once here, so the GPU processes do not all download them at the same time.
+            load_vgg19_weights()
 
-    if args.num_GPUs > 1:
-        launch_distributed_training(args)
-        return
-
-    context = single_process_context(use_cuda=args.num_GPUs > 0)
-    loss_stats = run_training(args, context)
-    save_training_plot(loss_stats, args.save_path)
-    torch.cuda.empty_cache()
+        if args.num_GPUs > 1:
+            launch_distributed_training(args)
+        else:
+            run_training(args, single_process_context(use_cuda=args.num_GPUs > 0))
+    except BaseException:
+        # The error is shown on the screen as usual; this also keeps it in train.log.
+        traceback.print_exc(file=log.file)
+        raise
 
 
 # Needed on Windows: every DataLoader worker and every GPU process re-runs this file from the top.

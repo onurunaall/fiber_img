@@ -16,9 +16,8 @@ n_colors = 1
 ext = ".png"
 
 # Training. The recipe follows arch (every arch but sgarnet uses the unet recipe). Left out here, lr,
-# batch_size, patch_size and augment get the recipe's default; set them in a table below to change them:
-#   unet recipe:    lr 1e-4, batch_size 4, patch_size 0 (full images), augment "none"
-#   sgarnet recipe: lr 1e-3, batch_size 8, patch_size 368, augment "flips+rot90"
+# batch_size, patch_size and augment get the recipe's default (python train.py --help shows them);
+# set them in a table below to change them.
 num_epochs = 50
 val_batch_size = 4           # global batch size, split across num_GPUs
 lr_DropFactor = 0.5          # unet recipe: lr *= lr_DropFactor every lr_DropPeriod epochs
@@ -33,7 +32,7 @@ amp = false                  # bfloat16 mixed precision: about half the GPU memo
 
 # Output. save_path (set per architecture below) is a parent folder: every new run saves its files
 # in a new subfolder there, named <date>_<time>_<arch>, e.g. 2026-10-19_14-30-05_unet. Resuming
-# with --pretrain (without --start-epoch) continues in the folder of its checkpoint.
+# with --pretrain (without --start_epoch) continues in the folder of its checkpoint.
 save_everyEpoch = 10
 valid_everyEpoch = 1
 

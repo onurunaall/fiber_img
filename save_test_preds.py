@@ -1,37 +1,66 @@
+"""Saves the prediction of every image pair, plus a side-by-side comparison.
+
+Usage:  python save_test_preds.py CHECKPOINT DIR_Z DIR_X OUT_DIR [ARCH] [--n_colors N]
+ARCH: unet (default), unet_v2, unet_edsr, unet_v2_edsr or sgarnet. Writes OUT_DIR/pred/<name>_pred.png and
+OUT_DIR/compare/<name>_compare.png (left: sim_MCF input, middle: prediction, right: HR target).
+"""
+import argparse
 import os
-import sys
 
 import cv2
 import numpy as np
+import numpy.typing as npt
 import torch
 
 from imageDatastore import imageDatastore
-from model_factory import load_trained_model
+from model_factory import available_architectures, load_trained_model
 from utils import tensor2np
 
-# Usage: python save_test_preds.py CHECKPOINT DIR_Z DIR_X OUT_DIR [ARCH]   (ARCH: unet (default), unet_v2, unet_edsr, unet_v2_edsr or sgarnet)
-checkpoint_path, dir_z, dir_x, out_dir = sys.argv[1:5]
-architecture = sys.argv[5] if len(sys.argv) > 5 else "unet"
-os.makedirs(os.path.join(out_dir, "pred"), exist_ok=True)
-os.makedirs(os.path.join(out_dir, "compare"), exist_ok=True)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = load_trained_model(checkpoint_path, architecture, n_colors=1).to(device)
-dataset = imageDatastore(dir_z, dir_x)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Save the predictions of a checkpoint as 8-bit PNG files.")
+    parser.add_argument("checkpoint", help="checkpoint file written by train.py")
+    parser.add_argument("dir_z", help="folder of the HR targets")
+    parser.add_argument("dir_x", help="folder of the sim_MCF inputs")
+    parser.add_argument("out_dir", help="the pred/ and compare/ folders are made here")
+    parser.add_argument("arch", nargs="?", default="unet", choices=available_architectures(),
+                        help="architecture of the checkpoint (default: unet)")
+    parser.add_argument("--n_colors", default=1, type=int, help="number of color channels to use")
+    return parser.parse_args()
 
-with torch.no_grad():
-    for index in range(len(dataset)):
-        input_tensor, target_tensor = dataset[index]
-        prediction = model(input_tensor.unsqueeze(0).to(device))[0]
 
-        input_img = tensor2np(input_tensor)[:, :, 0]
-        pred_img = tensor2np(prediction)[:, :, 0]
-        target_img = tensor2np(target_tensor)[:, :, 0]
+def to_cv2_image(tensor: torch.Tensor) -> npt.NDArray[np.uint8]:
+    """A (C, H, W) tensor as an 8-bit image for cv2.imwrite: gray as (H, W), color from RGB to cv2's BGR order."""
+    image = tensor2np(tensor)
+    return image[:, :, 0] if image.shape[2] == 1 else np.ascontiguousarray(image[:, :, ::-1])
 
-        name = os.path.splitext(os.path.basename(dataset.list_X[index]))[0]
-        cv2.imwrite(os.path.join(out_dir, "pred", name + "_pred.png"), pred_img)
-        # left: sim_MCF input, middle: prediction, right: HR target
-        side_by_side = np.concatenate([input_img, pred_img, target_img], axis=1)
-        cv2.imwrite(os.path.join(out_dir, "compare", name + "_compare.png"), side_by_side)
 
-print(f"Saved {len(dataset)} predictions to {out_dir}")
+def main() -> None:
+    args = parse_args()
+    os.makedirs(os.path.join(args.out_dir, "pred"), exist_ok=True)
+    os.makedirs(os.path.join(args.out_dir, "compare"), exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_trained_model(args.checkpoint, args.arch, n_colors=args.n_colors).to(device)
+    dataset = imageDatastore(args.dir_z, args.dir_x, n_colors=args.n_colors)
+
+    with torch.no_grad():
+        for index in range(len(dataset)):
+            input_tensor, target_tensor = dataset[index]
+            prediction = model(input_tensor.unsqueeze(0).to(device))[0]
+
+            input_img = to_cv2_image(input_tensor)
+            pred_img = to_cv2_image(prediction)
+            target_img = to_cv2_image(target_tensor)
+
+            name = os.path.splitext(os.path.basename(dataset.list_X[index]))[0]
+            cv2.imwrite(os.path.join(args.out_dir, "pred", name + "_pred.png"), pred_img)
+            # left: sim_MCF input, middle: prediction, right: HR target
+            side_by_side = np.concatenate([input_img, pred_img, target_img], axis=1)
+            cv2.imwrite(os.path.join(args.out_dir, "compare", name + "_compare.png"), side_by_side)
+
+    print(f"Saved {len(dataset)} predictions to {args.out_dir}")
+
+
+if __name__ == "__main__":
+    main()

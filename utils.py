@@ -15,6 +15,7 @@ from skimage.metrics import structural_similarity as ssim
 import torch
 import torchvision
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer
 from torchvision import models
 # from torch.utils.data import DataLoader
@@ -54,14 +55,16 @@ def get_list(path: str, ext: str = ".png") -> list[str]:
 
 def save_checkpoint(
     model: nn.Module,
-    model_arch: nn.Module,
     optimizer: Optimizer,
     epoch: int,
     loss_stats: dict[str, list[float]],
     args: argparse.Namespace,
     file_name: str,
 ) -> None:
-    """Saves the model weights, optimizer state, loss history and arguments as file_name in args.save_path."""
+    """Saves the model weights, optimizer state, loss history and arguments as file_name in args.save_path.
+
+    With args.save_model_arch, the whole (trained) model object is saved too.
+    """
     print(f"=> Saving checkpoint {file_name}")
     # checkpoint = {"state_dict": model.state_dict(), "optimizer": optimizer.state_dict(),}
     checkpoint: dict[str, Any] = {
@@ -73,7 +76,7 @@ def save_checkpoint(
         }
     
     if args.save_model_arch:
-        checkpoint.update({"model_arch": model_arch})
+        checkpoint.update({"model_arch": unwrap_module(model)})
 
     # Written to a temporary file first, so an interrupted save never leaves a broken file behind
     # (net_best.pth.tar is overwritten every time validation improves).
@@ -85,7 +88,7 @@ def save_checkpoint(
 
 def load_checkpoint(checkpoint: Mapping[str, Any], model: nn.Module) -> None:
     """Loads the weights of a checkpoint saved by save_checkpoint into model."""
-    if isinstance(model, nn.DataParallel):
+    if isinstance(model, (nn.DataParallel, DistributedDataParallel)):
         # DP
         print("=> Loading checkpoint with data parallel")
         state_dict = fix_state_dict_for_loading(checkpoint["state_dict"], to_dataparallel=True)
@@ -387,8 +390,9 @@ def get_pixels_around_core_4(
 
 
 def unwrap_module(m: nn.Module) -> nn.Module:
-    """Returns the model inside an nn.DataParallel wrapper, or m itself."""
-    return m.module if isinstance(m, nn.DataParallel) else m
+    """Returns the model inside an nn.DataParallel or DistributedDataParallel wrapper, or m itself."""
+    # DistributedDataParallel is not a kind of nn.DataParallel, so it must be named too.
+    return m.module if isinstance(m, (nn.DataParallel, DistributedDataParallel)) else m
 
 
 def fix_state_dict_for_loading(sd: Mapping[str, torch.Tensor], to_dataparallel: bool) -> OrderedDict[str, torch.Tensor]:

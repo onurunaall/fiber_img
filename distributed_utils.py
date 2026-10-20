@@ -1,4 +1,5 @@
 import socket
+import sys
 from dataclasses import dataclass
 
 import torch
@@ -37,10 +38,25 @@ def find_free_port() -> int:
         return port
 
 
+def use_libuv() -> bool:
+    """libuv is the default TCPStore backend, but the Windows builds of torch have none."""
+    return sys.platform != "win32"
+
+
+def open_meeting_point() -> dist.TCPStore:
+    """Opens the place where the training processes meet, on a free port of 127.0.0.1.
+
+    The launching program keeps it open while the processes run, so no other program can take the
+    port between choosing it and using it. Its port is passed on to init_distributed.
+    """
+    return dist.TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False, use_libuv=use_libuv())
+
+
 def init_distributed(rank: int, world_size: int, port: int) -> DistributedContext:
     """Joins the process group of a single machine. Each process drives the GPU with index == rank.
 
     Without CUDA, all processes run on the CPU, which is only useful for testing.
+    port: the port of open_meeting_point() in the launching program.
     """
     if torch.cuda.is_available():
         device = torch.device("cuda", rank)
@@ -50,12 +66,8 @@ def init_distributed(rank: int, world_size: int, port: int) -> DistributedContex
 
     # NCCL is the fast GPU backend but only exists on Linux. Gloo is the fallback on Windows.
     backend = "nccl" if dist.is_nccl_available() and device.type == "cuda" else "gloo"
-    dist.init_process_group(
-        backend=backend,
-        init_method=f"tcp://127.0.0.1:{port}",
-        rank=rank,
-        world_size=world_size,
-    )
+    store = dist.TCPStore("127.0.0.1", port, is_master=False, use_libuv=use_libuv())
+    dist.init_process_group(backend=backend, store=store, rank=rank, world_size=world_size)
     return DistributedContext(rank=rank, world_size=world_size, device=device)
 
 
@@ -69,15 +81,6 @@ def cleanup_distributed(context: DistributedContext) -> None:
     """Leaves the process group, if training is distributed."""
     if context.is_distributed:
         dist.destroy_process_group()
-
-
-def per_process_batch_size(global_batch_size: int, world_size: int) -> int:
-    """Splits the global batch size evenly across the processes; raises if it does not divide."""
-    if global_batch_size % world_size != 0:
-        raise ValueError(
-            f"Batch size {global_batch_size} must be divisible by the number of GPUs ({world_size})."
-        )
-    return global_batch_size // world_size
 
 
 def sum_across_processes(values: list[float], context: DistributedContext) -> list[float]:

@@ -1,5 +1,6 @@
 import argparse
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,19 +21,21 @@ EDSR_DEFAULT_FEATS = 256
 COMPILE_MODES = ("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs")
 
 
-def build_unet(in_channels: int, out_channels: int) -> nn.Module:
-    return UNET(in_channels=in_channels, out_channels=out_channels, inplace=False)
-
-
-def build_unet_v2(in_channels: int, out_channels: int) -> nn.Module:
-    # The UNet with 8 channels instead of out_channels at full size, plus a skip connection at full size.
-    return UNET(in_channels=in_channels, out_channels=out_channels, inplace=False, full_size_skip=True)
+def build_unet(in_channels: int, out_channels: int, full_size_skip: bool = False) -> nn.Module:
+    # full_size_skip (unet_v2): 8 channels instead of out_channels at full size, plus a skip connection at full size.
+    return UNET(in_channels=in_channels, out_channels=out_channels, inplace=False, full_size_skip=full_size_skip)
 
 
 def build_unet_edsr(
-    in_channels: int, out_channels: int, n_resblocks: int, n_feats: int, res_scale: float = 1.0
+    in_channels: int,
+    out_channels: int,
+    n_resblocks: int,
+    n_feats: int,
+    res_scale: float = 1.0,
+    full_size_skip: bool = False,
 ) -> nn.Module:
     # UNet (input -> 8 channels) followed by an EDSR with scale 1, i.e. no upsampling: the output has the input size.
+    # full_size_skip (unet_v2_edsr): the UNet of unet_v2, which adds ConvIn's output back at full size, before the EDSR.
     return UNET_EDSR(
         in_channels=in_channels,
         out_channels=out_channels,
@@ -41,23 +44,7 @@ def build_unet_edsr(
         n_feats=n_feats,
         scale=1,
         inplace=False,
-        res_scale=res_scale,
-    )
-
-
-def build_unet_v2_edsr(
-    in_channels: int, out_channels: int, n_resblocks: int, n_feats: int, res_scale: float = 1.0
-) -> nn.Module:
-    # unet_edsr with the UNet of unet_v2: its UNet adds ConvIn's output back at full size, before the EDSR.
-    return UNET_EDSR(
-        in_channels=in_channels,
-        out_channels=out_channels,
-        features=[32, 64, 128, 256],
-        n_resblocks=n_resblocks,
-        n_feats=n_feats,
-        scale=1,
-        inplace=False,
-        full_size_skip=True,
+        full_size_skip=full_size_skip,
         res_scale=res_scale,
     )
 
@@ -87,9 +74,9 @@ def build_sgarnet(in_channels: int, out_channels: int, lattice_period_px: float,
 # To add an architecture: write a builder function and register it here under a new name.
 MODEL_BUILDERS: dict[str, ModelBuilder] = {
     "unet": build_unet,
-    "unet_v2": build_unet_v2,
+    "unet_v2": partial(build_unet, full_size_skip=True),
     "unet_edsr": build_unet_edsr,
-    "unet_v2_edsr": build_unet_v2_edsr,
+    "unet_v2_edsr": partial(build_unet_edsr, full_size_skip=True),
     "sgarnet": build_sgarnet,
 }
 

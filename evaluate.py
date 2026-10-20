@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
+from config_file import parse_args_with_config
 from imageDatastore import imageDatastore
 from model_factory import COMPILE_MODES, available_architectures, compile_model, load_trained_model
 from validation import Predictor, accumulate_validation_totals, compute_validation_result
@@ -24,17 +25,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile", action="store_true", help="optimize --checkpoint with torch.compile")
     parser.add_argument("--compile_mode", default="default", choices=COMPILE_MODES)
 
-    parser.add_argument("--dir_ZValid", required=True, type=str)
-    parser.add_argument("--dir_XValid", required=True, type=str)
+    # Like train.py: no default folders. Set them with --config config.toml or on the command line.
+    parser.add_argument("--dir_ZValid", default=None, type=str, help="folder of the validation targets (HR)")
+    parser.add_argument("--dir_XValid", default=None, type=str, help="folder of the validation inputs (sim_MCF)")
     parser.add_argument("--n_colors", default=1, type=int, help="number of color channels to use")
     parser.add_argument("--rgb_range", default=1, type=int, help="maxium value of RGB")
     parser.add_argument("--ext", default=".png", type=str)
     parser.add_argument("--val_batch_size", default=4, type=int)
-    parser.add_argument("--num_workers", default=8, type=int)
+    parser.add_argument("--num_workers", default=4, type=int)
 
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--timed_iterations", default=50, type=int)
-    return parser.parse_args()
+    # The config of train.py works here too: options that only train.py has are skipped.
+    args = parse_args_with_config(parser, ignore_unknown=True)
+
+    missing = [name for name in ("dir_ZValid", "dir_XValid") if getattr(args, name) is None]
+    if missing:
+        parser.error(f"no data folder given for {', '.join(missing)}: set it in the config file (--config) "
+                     f"or on the command line, e.g. --{missing[0]} FOLDER")
+    return args
 
 
 def load_predictor(args: argparse.Namespace, device: torch.device) -> Predictor:
@@ -96,7 +105,7 @@ def main() -> None:
         batch_size=args.val_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
         drop_last=False,
     )
 
@@ -105,7 +114,7 @@ def main() -> None:
 
     totals = accumulate_validation_totals(predict, loader, criterion, device)
     result = compute_validation_result(totals)
-    print(f"Valid loss: {result.loss:.4f} \t\t PSNR: {result.psnr:.4f} \t\t SSIM: {result.ssim:.4f}")
+    print(result.text())
 
     first_batch_inputs = next(iter(loader))[0].to(device)
     latency = measure_latency_ms(predict, first_batch_inputs, args.warmup_iterations, args.timed_iterations)

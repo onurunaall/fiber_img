@@ -15,7 +15,9 @@ IMG_EXTENSIONS = ['.png', '.npy', ]
 def default_loader(path: str, n_colors: int) -> npt.NDArray[Any]:
     """Reads an image file unchanged; with n_colors 3, converts it from BGR to RGB."""
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-    assert img is not None, 'cv2 could not read the image: %s' % path
+    # A real check, not assert: assert is switched off when Python runs with -O.
+    if img is None:
+        raise FileNotFoundError('cv2 could not read the image: %s' % path)
     if n_colors == 3:
         # RGB image
         return img[:, :, [2, 1, 0]]   # BGR to RGB
@@ -35,7 +37,8 @@ def is_image_file(filename: str) -> bool:
 def make_dataset(dir: str) -> list[str]:
     """Returns the paths of all image files in dir and its subfolders."""
     images = []
-    assert os.path.isdir(dir), '%s is not a valid directory' % dir
+    if not os.path.isdir(dir):
+        raise NotADirectoryError('%s is not a valid directory' % dir)
 
     for root, _, fnames in sorted(os.walk(dir)):
         for fname in fnames:
@@ -109,12 +112,13 @@ class imageDatastore(data.Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
     def _check_pairs(self) -> None:
         """Checks that X file number i and Z file number i show the same image."""
-        assert len(self.list_X) == len(self.list_Z), \
-            'X has %d files but Z has %d files' % (len(self.list_X), len(self.list_Z))
+        if len(self.list_X) != len(self.list_Z):
+            raise ValueError('X has %d files but Z has %d files' % (len(self.list_X), len(self.list_Z)))
         for path_X, path_Z in zip(self.list_X, self.list_Z):
             num_X = re.findall(r'\d+', os.path.basename(path_X))
             num_Z = re.findall(r'\d+', os.path.basename(path_Z))
-            assert num_X == num_Z, 'Pair mismatch: %s <-> %s' % (path_X, path_Z)
+            if num_X != num_Z:
+                raise ValueError('Pair mismatch: %s <-> %s' % (path_X, path_Z))
     
     def _get_patch(
         self, imgX: npt.NDArray[Any], imgZ: npt.NDArray[Any]

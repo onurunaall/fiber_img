@@ -227,8 +227,8 @@ class UNET(nn.Module):
     def forward(self, x):
         factor = 2 ** len(self.unetEncoder)   # 4 down blocks -> 16
 
-        assert x.shape[-2] % factor == 0 and x.shape[-1] % factor == 0, \
-            'Height and width must be divisible by %d, got %s' % (factor, tuple(x.shape[-2:]))
+        if x.shape[-2] % factor != 0 or x.shape[-1] % factor != 0:
+            raise ValueError('Height and width must be divisible by %d, got %s' % (factor, tuple(x.shape[-2:])))
 
         skip_connects = []
         

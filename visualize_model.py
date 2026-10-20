@@ -1,3 +1,9 @@
+"""Draws unet_setup.png and unet_setup.svg: a hand-placed picture of the original unet (--arch unet).
+
+Run:  python visualize_model.py
+The picture is drawn by hand, not from the model code, so it does not follow later changes to the model and
+does not show unet_v2 (8 channels and a skip connection at full size) or the EDSR part. Nothing imports this file.
+"""
 import matplotlib.patches as patches
 from matplotlib.patches import FancyArrowPatch
 import matplotlib.pyplot as plt
