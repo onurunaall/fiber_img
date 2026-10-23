@@ -1,5 +1,5 @@
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
@@ -13,6 +13,7 @@ from utils import load_checkpoint
 
 
 type ModelBuilder = Callable[..., nn.Module]
+type ModelDescription = dict[str, Any]
 
 # EDSR size of the commented-out UNET_EDSR line in the original train.py (n_resblocks=32, n_feats=256)
 EDSR_DEFAULT_RESBLOCKS = 32
@@ -111,6 +112,20 @@ def architecture_options(architecture: str, args: argparse.Namespace) -> dict[st
     return {"lattice_period_px": period, "lattice_angle_deg": angle}
 
 
+def model_description(args: argparse.Namespace) -> ModelDescription:
+    """What the model is, e.g. {"arch": "unet_edsr", "n_colors": 1, "options": {"n_resblocks": 32, ...}}.
+
+    Saved in every checkpoint as checkpoint["model"], so the checkpoint can build its own model again.
+    """
+    architecture = getattr(args, "arch", "unet")  # the first train.py (before --arch existed) only trained the unet
+    return {"arch": architecture, "n_colors": args.n_colors, "options": architecture_options(architecture, args)}
+
+
+def saved_model_description(checkpoint: Mapping[str, Any]) -> ModelDescription:
+    """The model description of a checkpoint. Checkpoints from before 2026-10-22 have none: their 'args' hold it."""
+    return checkpoint["model"] if "model" in checkpoint else model_description(checkpoint["args"])
+
+
 def build_model(architecture: str, in_channels: int, out_channels: int, **options: Any) -> nn.Module:
     if architecture not in MODEL_BUILDERS:
         known = ", ".join(available_architectures())
@@ -120,12 +135,18 @@ def build_model(architecture: str, in_channels: int, out_channels: int, **option
     return builder(in_channels, out_channels, **options)
 
 
-def load_trained_model(checkpoint_path: Path, architecture: str, n_colors: int) -> nn.Module:
-    # weights_only=False: the file also stores 'args'. Only load checkpoint files you trust.
+def build_described_model(description: ModelDescription) -> nn.Module:
+    n_colors = description["n_colors"]
+    return build_model(description["arch"], in_channels=n_colors, out_channels=n_colors, **description["options"])
+
+
+def load_trained_model(checkpoint_path: Path) -> nn.Module:
+    """The model of a train.py checkpoint, with its weights, in eval mode. The checkpoint says what model it is."""
+    # weights_only=False: old checkpoints store 'args' as an argparse.Namespace, and --save_model_arch stores the whole
+    # model object. Only load checkpoint files you trust.
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-    options = architecture_options(architecture, checkpoint["args"])
-    model = build_model(architecture, in_channels=n_colors, out_channels=n_colors, **options)
+    model = build_described_model(saved_model_description(checkpoint))
     load_checkpoint(checkpoint, model)
     return model.eval()
 

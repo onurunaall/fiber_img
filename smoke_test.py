@@ -4,11 +4,14 @@ Run:  python smoke_test.py
 
 Two quick checks first: the validation PSNR / SSIM equal skimage's, and a small unet can memorize one image.
 Then it covers unet, unet_v2, a small unet_edsr and unet_v2_edsr, --amp, the config file (also its type
-checks), resuming with --pretrain, --start_epoch, --save_model_arch, the setting checks, the files a run writes
-(checkpoints, train.log, plot), the run folders (a new run never touches an earlier run's files),
-evaluate.py with --config, and, on a computer without a GPU, a run with 2 processes (DistributedDataParallel).
+checks), resuming with --pretrain (and that it stops when the model settings differ from the checkpoint's),
+--start_epoch, --save_model_arch, the setting checks, the files a run writes (checkpoints, train.log, plot), the model
+description in the checkpoints (also for old checkpoints without one), the run folders (a new run never touches an
+earlier run's files), evaluate.py with --config and without --arch, and, on a computer without a GPU, a run with
+2 processes (DistributedDataParallel).
 sgarnet is left out: its loss downloads the VGG19 weights (about 550 MB).
 """
+import argparse
 import subprocess
 import sys
 import tempfile
@@ -75,7 +78,9 @@ def check_metrics() -> None:
     predictions = targets + 0.2 * torch.randn(targets.shape, generator=generator)
     psnr, ssim = psnr_ssim_8bit(predictions, targets)
     for index in range(3):
+        before = predictions[index].clone()
         prediction_image, target_image = tensor2np(predictions[index]), tensor2np(targets[index])
+        assert torch.equal(predictions[index], before), "tensor2np changed the tensor it was given"
         assert abs(psnr[index].item() - compute_psnr(target_image, prediction_image)) < 1e-9, "PSNR differs from skimage"
         assert abs(ssim[index].item() - compute_ssim(prediction_image, target_image)) < 1e-9, "SSIM differs from skimage"
     print("Validation PSNR / SSIM equal skimage's.", flush=True)
@@ -175,8 +180,22 @@ def main() -> None:
         [_, edsr] = run_folders(runs)
         assert edsr.name.endswith("_unet_edsr"), edsr.name
         assert {path.name: path.read_bytes() for path in unet.iterdir()} == unet_files, "a new run changed an earlier run's files"
-        edsr_args = load_checkpoint(edsr / "net_epoch_1.pth.tar")["args"]
-        assert edsr_args.edsr_n_feats == 16 and edsr_args.edsr_res_scale == 0.1 and edsr_args.amp, edsr_args  # type: ignore[attr-defined]
+        # The checkpoint says which model it holds, and stores the settings as plain text and numbers.
+        edsr_checkpoint = load_checkpoint(edsr / "net_epoch_1.pth.tar")
+        assert edsr_checkpoint["model"] == {"arch": "unet_edsr", "n_colors": 1,
+                                            "options": {"n_resblocks": 2, "n_feats": 16, "res_scale": 0.1}}, edsr_checkpoint
+        edsr_args = edsr_checkpoint["args"]
+        assert isinstance(edsr_args, dict) and edsr_args["amp"] is True, edsr_args
+        # save_path stays the parent folder of the settings; the run has its own folder inside it.
+        assert edsr_args["save_path"] == str(runs), edsr_args["save_path"]
+        # Plain data only (no PosixPath, no argparse.Namespace): a Linux checkpoint opens on Windows.
+        torch.load(edsr / "net_epoch_1.pth.tar", map_location="cpu", weights_only=True)
+
+        # Resuming with other model settings than the checkpoint's stops with a clear message.
+        resume_edsr = ("--config", str(config), "--num_epochs", "2", "--pretrain", "--dir_pretrain",
+                       str(edsr / "net_epoch_1.pth.tar"))
+        train_fails("holds the model", *resume_edsr, "--arch", "unet_edsr", "--edsr_res_scale", "1.0")
+        train_fails("holds the model", *resume_edsr, "--arch", "unet_v2_edsr", "--edsr_res_scale", "0.1")
 
         # unet_v2 trains, and ends with 8 channels at full size (ConvOut: 8 -> 1 channels).
         # --save_model_arch saves the trained model object, with the same weights as the checkpoint.
@@ -193,7 +212,22 @@ def main() -> None:
         # unet_v2_edsr trains and gets the EDSR size of its [unet_v2_edsr] table.
         train_ok("--config", str(config), "--arch", "unet_v2_edsr", "--num_epochs", "1", "--save_path", str(runs))
         [unet_v2_edsr] = [path for path in run_folders(runs) if path.name.endswith("_unet_v2_edsr")]
-        assert load_checkpoint(unet_v2_edsr / "net_epoch_1.pth.tar")["args"].edsr_n_feats == 16  # type: ignore[attr-defined]
+        assert load_checkpoint(unet_v2_edsr / "net_epoch_1.pth.tar")["model"]["options"]["n_feats"] == 16  # type: ignore[index]
+
+        # evaluate.py needs no --arch: the checkpoint says which model it holds.
+        run = run_script("evaluate.py", "--checkpoint", str(unet_v2_edsr / "net_epoch_1.pth.tar"), "--config", str(config),
+                         "--warmup_iterations", "1", "--timed_iterations", "1")
+        assert run.returncode == 0 and "Valid L1" in run.stdout, run.stdout + run.stderr
+
+        # A checkpoint from before the model description (no "model", settings as an argparse.Namespace) still loads.
+        from model_factory import load_trained_model
+        old_style = load_checkpoint(unet_v2_edsr / "net_epoch_1.pth.tar")
+        del old_style["model"]
+        old_style["args"] = argparse.Namespace(**old_style["args"])  # type: ignore[arg-type]
+        torch.save(old_style, root / "old_style.pth.tar")
+        model_state = load_trained_model(root / "old_style.pth.tar").state_dict()
+        assert all(torch.equal(model_state[key], value) for key, value in old_style["state_dict"].items()), (  # type: ignore[union-attr]
+            "an old-style checkpoint did not load")
 
         # A batch size that does not split across the GPUs stops before any GPU process starts.
         run = train("--config", str(config), "--num_GPUs", "2", "--val_batch_size", "1", "--save_path", str(root / "x"))

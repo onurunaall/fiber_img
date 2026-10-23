@@ -8,10 +8,11 @@
 arch = "unet"                # unet, unet_v2, unet_edsr, unet_v2_edsr or sgarnet
 
 # Data: Z = HR target, X = sim_MCF input. Height and width must be multiples of 16.
-dir_ZTrain = "/workspace/data/HR_Train"
-dir_XTrain = "/workspace/data/sim_MCF_Train"
-dir_ZValid = "/workspace/data/HR_Valid"
-dir_XValid = "/workspace/data/sim_MCF_Valid"
+# The folders on Kai. Change them here if your data is elsewhere.
+dir_ZTrain = "/scratch/ouenal/fiber_data/720/HR_Train"
+dir_XTrain = "/scratch/ouenal/fiber_data/720/sim_MCF_Train"
+dir_ZValid = "/scratch/ouenal/fiber_data/720/HR_Valid"
+dir_XValid = "/scratch/ouenal/fiber_data/720/sim_MCF_Valid"
 n_colors = 1
 ext = ".png"
 
@@ -38,23 +39,26 @@ valid_everyEpoch = 1
 
 
 [unet]
-save_path = "/workspace/ckpt_unet"
+save_path = "/scratch/ouenal/runs/unet"
 
 
 [unet_v2]
 # The unet with 8 channels and a skip connection at full image size.
-save_path = "/workspace/ckpt_unet_v2"
+save_path = "/scratch/ouenal/runs/unet_v2"
 
 
 [unet_edsr]
 # GPU memory: training keeps about 68 KB per pixel per image with 32 blocks x 256 features
-# (e.g. 720 x 720 images: about 33 GiB per image in the batch). To fit a smaller GPU, lower
+# (e.g. 720 x 720 images: about 33 GiB per image in the batch, about 19 GiB with amp). To fit a smaller GPU, lower
 # batch_size, train on crops (patch_size), or use a smaller EDSR (16 blocks x 64 features: about 9.5 KB per pixel).
+# The settings below are those of the unet_v2_edsr run started on Kai on 2026-10-19.
 edsr_n_resblocks = 32
 edsr_n_feats = 256
-edsr_res_scale = 1.0          # the EDSR paper uses 0.1 for 32 x 256, to train stably
+edsr_res_scale = 0.1         # the EDSR paper uses 0.1 for 32 x 256, to train stably
+batch_size = 1               # one 720 x 720 image per step: batch size 4 does not fit on a 48 GB GPU
+amp = true                   # bfloat16 mixed precision
 val_batch_size = 1           # validation always uses full images
-save_path = "/workspace/ckpt_unet_edsr"
+save_path = "/scratch/ouenal/runs/unet_edsr"
 
 
 [unet_v2_edsr]
@@ -62,13 +66,15 @@ save_path = "/workspace/ckpt_unet_edsr"
 # as unet_edsr (see above).
 edsr_n_resblocks = 32
 edsr_n_feats = 256
-edsr_res_scale = 1.0          # the EDSR paper uses 0.1 for 32 x 256, to train stably
+edsr_res_scale = 0.1         # the EDSR paper uses 0.1 for 32 x 256, to train stably
+batch_size = 1               # one 720 x 720 image per step: batch size 4 does not fit on a 48 GB GPU
+amp = true                   # bfloat16 mixed precision
 val_batch_size = 1           # validation always uses full images
-save_path = "/workspace/ckpt_unet_v2_edsr"
+save_path = "/scratch/ouenal/runs/unet_v2_edsr"
 
 
 [sgarnet]
 # Required for sgarnet: measure them with estimate_lattice_period.py on the training inputs.
 # sgarnet_lattice_period = 0.0
 # sgarnet_lattice_angle = 0.0
-save_path = "/workspace/ckpt_sgarnet"
+save_path = "/scratch/ouenal/runs/sgarnet"

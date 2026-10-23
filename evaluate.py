@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 
 from config_file import parse_args_with_config
 from imageDatastore import imageDatastore
-from model_factory import COMPILE_MODES, available_architectures, compile_model, load_trained_model
+from model_factory import COMPILE_MODES, compile_model, load_trained_model
 from validation import Predictor, accumulate_validation_totals, compute_validation_result
 
 
@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     model_source.add_argument("--checkpoint", type=Path, help="run a PyTorch checkpoint")
     model_source.add_argument("--engine", type=Path, help="run a TensorRT engine")
 
-    parser.add_argument("--arch", default="unet", choices=available_architectures(), help="architecture of --checkpoint")
+    # No --arch: the checkpoint says which model it holds.
     parser.add_argument("--compile", action="store_true", help="optimize --checkpoint with torch.compile")
     parser.add_argument("--compile_mode", default="default", choices=COMPILE_MODES)
 
@@ -36,7 +36,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--timed_iterations", default=50, type=int)
-    # The config of train.py works here too: options that only train.py has are skipped.
+    # The config of train.py works here too: options that only train.py has are skipped, and so are the
+    # [arch] tables (this script has no --arch). For the latency of one image, use --val_batch_size 1.
     args = parse_args_with_config(parser, ignore_unknown=True)
 
     missing = [name for name in ("dir_ZValid", "dir_XValid") if getattr(args, name) is None]
@@ -54,7 +55,7 @@ def load_predictor(args: argparse.Namespace, device: torch.device) -> Predictor:
 
         return TensorRTModel(args.engine, device)
 
-    model = load_trained_model(args.checkpoint, args.arch, args.n_colors).to(device)
+    model = load_trained_model(args.checkpoint).to(device)
     if args.compile:
         model = compile_model(model, args.compile_mode)
     return model

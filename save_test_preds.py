@@ -1,7 +1,7 @@
 """Saves the prediction of every image pair, plus a side-by-side comparison.
 
-Usage:  python save_test_preds.py CHECKPOINT DIR_Z DIR_X OUT_DIR [ARCH] [--n_colors N]
-ARCH: unet (default), unet_v2, unet_edsr, unet_v2_edsr or sgarnet. Writes OUT_DIR/pred/<name>_pred.png and
+Usage:  python save_test_preds.py CHECKPOINT DIR_Z DIR_X OUT_DIR [--n_colors N]
+The checkpoint says which model it holds. Writes OUT_DIR/pred/<name>_pred.png and
 OUT_DIR/compare/<name>_compare.png (left: sim_MCF input, middle: prediction, right: HR target).
 """
 import argparse
@@ -13,7 +13,7 @@ import numpy.typing as npt
 import torch
 
 from imageDatastore import imageDatastore
-from model_factory import available_architectures, load_trained_model
+from model_factory import load_trained_model
 from utils import tensor2np
 
 
@@ -23,8 +23,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("dir_z", help="folder of the HR targets")
     parser.add_argument("dir_x", help="folder of the sim_MCF inputs")
     parser.add_argument("out_dir", help="the pred/ and compare/ folders are made here")
-    parser.add_argument("arch", nargs="?", default="unet", choices=available_architectures(),
-                        help="architecture of the checkpoint (default: unet)")
     parser.add_argument("--n_colors", default=1, type=int, help="number of color channels to use")
     return parser.parse_args()
 
@@ -41,7 +39,7 @@ def main() -> None:
     os.makedirs(os.path.join(args.out_dir, "compare"), exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_trained_model(args.checkpoint, args.arch, n_colors=args.n_colors).to(device)
+    model = load_trained_model(args.checkpoint).to(device)
     dataset = imageDatastore(args.dir_z, args.dir_x, n_colors=args.n_colors)
 
     with torch.no_grad():

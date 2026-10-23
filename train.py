@@ -32,10 +32,13 @@ from model_factory import (
     COMPILE_MODES,
     EDSR_DEFAULT_FEATS,
     EDSR_DEFAULT_RESBLOCKS,
+    ModelDescription,
     architecture_options,
     available_architectures,
-    build_model,
+    build_described_model,
     compile_model,
+    model_description,
+    saved_model_description,
 )
 from utils import (
     Timer,
@@ -369,12 +372,96 @@ def create_optimizer(network: nn.Module, args: argparse.Namespace) -> optim.Opti
     return optim.Adam(network.parameters(), lr=args.lr)
 
 
-def run_training(args: argparse.Namespace, context: DistributedContext) -> None:
+def check_amp_support(args: argparse.Namespace, context: DistributedContext) -> None:
+    """Stops with a clear message if --amp is on but the GPU cannot compute in bfloat16."""
     if args.amp and context.device.type == "cuda" and not torch.cuda.is_bf16_supported(including_emulation=False):
         raise ValueError(
             f"--amp needs a GPU with bfloat16 support (Ampere or newer), "
             f"but {torch.cuda.get_device_name(context.device)} has none. Train without --amp."
         )
+
+
+def load_pretrained(
+    args: argparse.Namespace,
+    description: ModelDescription,
+    network: nn.Module,
+    optimizer: optim.Optimizer,
+    context: DistributedContext,
+) -> tuple[int, LossStats]:
+    """Loads the --pretrain checkpoint into network and optimizer. Returns (first epoch to train, its loss history).
+
+    Stops if the checkpoint holds another model than the settings of this run build.
+    """
+    # weights_only=False: old checkpoints store 'args' as an argparse.Namespace, and --save_model_arch stores the whole
+    # model object. Only load checkpoint files you trust.
+    checkpoint = torch.load(args.dir_pretrain, map_location=context.device, weights_only=False)
+    saved = saved_model_description(checkpoint)
+    if saved != description:
+        raise ValueError(
+            f"{args.dir_pretrain} holds the model {saved}, but the settings of this run build {description}. "
+            "Use the same --arch, --n_colors and --edsr_* options as the checkpoint."
+        )
+    load_checkpoint(checkpoint, network)
+    optimizer.load_state_dict(checkpoint["optimizer"])
+
+    if args.start_epoch is not None:
+        start_epoch = args.start_epoch
+    else:
+        start_epoch = checkpoint["epoch"] + 1
+        if start_epoch > args.num_epochs:
+            raise ValueError(
+                f"{args.dir_pretrain} ends at epoch {checkpoint['epoch']}, so there is nothing left to train "
+                f"up to --num_epochs {args.num_epochs}. Raise --num_epochs to train longer."
+            )
+    print_on_main(context, f"===> Starting at epoch {start_epoch} from {args.dir_pretrain}")
+    return start_epoch, dict(checkpoint["loss_stats"])
+
+
+def complete_loss_stats(loss_stats: LossStats, args: argparse.Namespace) -> LossStats:
+    """Adds the lists that a new run, or a checkpoint from before they were saved, does not have yet."""
+    loss_stats.setdefault("valid_epoch", list(range(1, len(loss_stats["valid"]) + 1)))
+    # Checkpoints from before PSNR and SSIM were saved get nan for their earlier validations.
+    for key in ("valid_psnr", "valid_ssim"):
+        loss_stats.setdefault(key, [math.nan] * len(loss_stats["valid"]))
+    if args.recipe != "unet":
+        loss_stats.setdefault("train_objective", [])
+    return loss_stats
+
+
+def check_nothing_overwritten(run_folder: str, start_epoch: int) -> None:
+    """Stops before training overwrites checkpoints of later epochs, e.g. when resuming from an older checkpoint.
+
+    A resumed run continues in the folder of its checkpoint (a new run's folder is empty).
+    """
+    later_checkpoints = sorted(
+        name for name in os.listdir(run_folder)
+        if (match := re.fullmatch(r"net_epoch_(\d+)\.pth\.tar", name)) and int(match.group(1)) >= start_epoch
+    )
+    if later_checkpoints:
+        raise ValueError(
+            f"{run_folder} already has {', '.join(later_checkpoints)}, which training from epoch {start_epoch} "
+            "would overwrite. Resume from the last checkpoint, or add --start_epoch to train into a new folder."
+        )
+
+
+def best_valid_loss_so_far(run_folder: str, loss_stats: LossStats) -> float:
+    """The lowest validation L1 of the loss history and of run_folder/net_best.pth.tar.
+
+    net_best.pth.tar can be newer than the resumed checkpoint (e.g. after a crash). Only a better model may replace it.
+    """
+    best_valid_loss = min(loss_stats["valid"]) if loss_stats["valid"] else float("inf")
+    best_path = os.path.join(run_folder, "net_best.pth.tar")
+    if os.path.isfile(best_path):
+        # mmap: only the loss history is read from the disk, not the weights and the optimizer state.
+        best_checkpoint = torch.load(best_path, map_location="cpu", weights_only=False, mmap=True)
+        best_valid_loss = min([best_valid_loss, *best_checkpoint["loss_stats"]["valid"]])
+        del best_checkpoint
+    return best_valid_loss
+
+
+def run_training(args: argparse.Namespace, context: DistributedContext, run_folder: str) -> None:
+    """Trains in run_folder: a new, empty folder, or the folder of the --pretrain checkpoint when resuming."""
+    check_amp_support(args, context)
     setup_seed(args.seed + context.rank)
     # All images of a run have the same size, so cuDNN can time its algorithms once and keep the fastest.
     torch.backends.cudnn.benchmark = True
@@ -382,59 +469,21 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> None:
     train_loader, train_sampler = create_train_loader(args, context)
     valid_loader = create_valid_loader(args, context)
 
-    network = build_model(
-        args.arch, in_channels=args.n_colors, out_channels=args.n_colors, **architecture_options(args.arch, args)
-    )
-    network = network.to(context.device)
+    description = model_description(args)
+    network = build_described_model(description).to(context.device)
 
     # Validation (and the choice of the best checkpoint) always uses the L1 loss, so all recipes are compared alike.
     criterion = nn.L1Loss().to(context.device)
     training_criterion = SGARNetLoss().to(context.device) if args.recipe == "sgarnet" else criterion
     optimizer = create_optimizer(network, args)
-    loss_stats: LossStats = {"train": [], "valid": [], "valid_expt": []}
+
     start_epoch = 1 if args.start_epoch is None else args.start_epoch
-
+    loss_stats: LossStats = {"train": [], "valid": [], "valid_expt": []}
     if args.pretrain:
-        # weights_only=False: the file also stores 'args'. Only load checkpoint files you trust.
-        checkpoint = torch.load(args.dir_pretrain, map_location=context.device, weights_only=False)
-        load_checkpoint(checkpoint, network)
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        loss_stats = dict(checkpoint["loss_stats"])
-        if args.start_epoch is None:
-            start_epoch = checkpoint["epoch"] + 1
-            if start_epoch > args.num_epochs:
-                raise ValueError(
-                    f"{args.dir_pretrain} ends at epoch {checkpoint['epoch']}, so there is nothing left to train "
-                    f"up to --num_epochs {args.num_epochs}. Raise --num_epochs to train longer."
-                )
-        print_on_main(context, f"===> Starting at epoch {start_epoch} from {args.dir_pretrain}")
-
-    loss_stats.setdefault("valid_epoch", list(range(1, len(loss_stats["valid"]) + 1)))
-    # Checkpoints from before PSNR and SSIM were saved get nan for their earlier validations.
-    for key in ("valid_psnr", "valid_ssim"):
-        loss_stats.setdefault(key, [math.nan] * len(loss_stats["valid"]))
-    if args.recipe != "unet":
-        loss_stats.setdefault("train_objective", [])
-    best_valid_loss = min(loss_stats["valid"]) if loss_stats["valid"] else float("inf")
-
-    # A resumed run continues in the folder of its checkpoint (a new run's folder is empty).
-    # Stop before overwriting checkpoints of later epochs, e.g. when resuming from an older checkpoint.
-    later_checkpoints = sorted(
-        name for name in os.listdir(args.save_path)
-        if (match := re.fullmatch(r"net_epoch_(\d+)\.pth\.tar", name)) and int(match.group(1)) >= start_epoch
-    )
-    if later_checkpoints:
-        raise ValueError(
-            f"{args.save_path} already has {', '.join(later_checkpoints)}, which training from epoch {start_epoch} "
-            "would overwrite. Resume from the last checkpoint, or add --start_epoch to train into a new folder."
-        )
-    # net_best.pth.tar can be newer than the resumed checkpoint (e.g. after a crash). Only a better model may replace it.
-    best_path = os.path.join(args.save_path, "net_best.pth.tar")
-    if os.path.isfile(best_path):
-        # mmap: only the loss history is read from the disk, not the weights and the optimizer state.
-        best_checkpoint = torch.load(best_path, map_location="cpu", weights_only=False, mmap=True)
-        best_valid_loss = min([best_valid_loss, *best_checkpoint["loss_stats"]["valid"]])
-        del best_checkpoint
+        start_epoch, loss_stats = load_pretrained(args, description, network, optimizer, context)
+    loss_stats = complete_loss_stats(loss_stats, args)
+    check_nothing_overwritten(run_folder, start_epoch)
+    best_valid_loss = best_valid_loss_so_far(run_folder, loss_stats)
 
     training_model, validation_model = prepare_models(network, args, context)
 
@@ -471,14 +520,16 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> None:
             if result.loss < best_valid_loss:
                 best_valid_loss = result.loss
                 if context.is_main_process:
-                    save_checkpoint(network, optimizer, epoch, loss_stats, args, "net_best.pth.tar")
+                    save_checkpoint(network, optimizer, epoch, loss_stats, args, description, run_folder,
+                                    "net_best.pth.tar")
             # Drawn after every validation, so a run that stops early still has its plot.
             if context.is_main_process:
-                save_training_plot(loss_stats, args.save_path)
+                save_training_plot(loss_stats, run_folder)
 
         do_save = epoch % args.save_everyEpoch == 0 or epoch == args.num_epochs
         if do_save and context.is_main_process:
-            save_checkpoint(network, optimizer, epoch, loss_stats, args, f"net_epoch_{epoch}.pth.tar")
+            save_checkpoint(network, optimizer, epoch, loss_stats, args, description, run_folder,
+                            f"net_epoch_{epoch}.pth.tar")
 
         epoch_end = timer.t()
         progress = (epoch - start_epoch + 1) / (args.num_epochs - start_epoch + 1)
@@ -490,8 +541,8 @@ def run_training(args: argparse.Namespace, context: DistributedContext) -> None:
     print_on_main(context, f"Total cost times: {time_text(timer.t())}")
 
 
-def save_training_plot(loss_stats: LossStats, save_path: str) -> None:
-    """Saves the training and validation loss curves as training_progress.png in save_path."""
+def save_training_plot(loss_stats: LossStats, folder: str) -> None:
+    """Saves the training and validation loss curves as training_progress.png in folder."""
     # A Figure without pyplot needs no screen and never waits for a window to be closed.
     figure = Figure(figsize=(10, 5))
     axes = figure.add_subplot()
@@ -502,7 +553,7 @@ def save_training_plot(loss_stats: LossStats, save_path: str) -> None:
     axes.set_ylabel("Loss")
     axes.set_yscale("log")
     axes.legend()
-    figure.savefig(os.path.join(save_path, "training_progress.png"))
+    figure.savefig(os.path.join(folder, "training_progress.png"))
 
 
 def make_run_folder(save_path: str, arch: str) -> str:
@@ -534,24 +585,24 @@ class Tee:
         return getattr(self.screen, name)
 
 
-def log_to_file(save_path: str) -> Tee:
-    """From now on, everything this process prints also goes to save_path/train.log (a resumed run adds to it)."""
-    log = Tee(os.path.join(save_path, "train.log"))
+def log_to_file(folder: str) -> Tee:
+    """From now on, everything this process prints also goes to folder/train.log (a resumed run adds to it)."""
+    log = Tee(os.path.join(folder, "train.log"))
     sys.stdout = log
     return log
 
 
-def distributed_worker(rank: int, args: argparse.Namespace, port: int) -> None:
+def distributed_worker(rank: int, args: argparse.Namespace, port: int, run_folder: str) -> None:
     if rank == 0:
-        log_to_file(args.save_path)
+        log_to_file(run_folder)
     context = init_distributed(rank, args.num_GPUs, port)
     try:
-        run_training(args, context)
+        run_training(args, context, run_folder)
     finally:
         cleanup_distributed(context)
 
 
-def launch_distributed_training(args: argparse.Namespace) -> None:
+def launch_distributed_training(args: argparse.Namespace, run_folder: str) -> None:
     available_gpus = torch.cuda.device_count()
     if torch.cuda.is_available() and args.num_GPUs > available_gpus:
         raise ValueError(f"--num_GPUs is {args.num_GPUs}, but only {available_gpus} GPU(s) are available.")
@@ -561,7 +612,7 @@ def launch_distributed_training(args: argparse.Namespace) -> None:
     # One process per GPU. Process number i (its "rank") trains on GPU i. The processes meet at a port
     # that this process keeps open while they run, so no other program can take it in between.
     meeting_point = open_meeting_point()
-    mp.spawn(distributed_worker, args=(args, meeting_point.port), nprocs=args.num_GPUs)
+    mp.spawn(distributed_worker, args=(args, meeting_point.port, run_folder), nprocs=args.num_GPUs)
 
 
 def main() -> None:
@@ -571,14 +622,15 @@ def main() -> None:
     architecture_options(args.arch, args)
 
     # Decided here, before any GPU process starts, so that all of them save into the same folder.
+    # args.save_path stays the parent folder of the settings; run_folder is the folder of this run.
     if args.pretrain and args.start_epoch is None:
         # Resuming continues the same run, in the folder of its checkpoint.
-        args.save_path = os.path.dirname(os.path.abspath(args.dir_pretrain))
+        run_folder = os.path.dirname(os.path.abspath(args.dir_pretrain))
     else:
         # A new run gets a new folder, so it never overwrites the files of an earlier run.
-        args.save_path = make_run_folder(args.save_path, args.arch)
-    log = log_to_file(args.save_path)
-    print(f"===> Saving the files of this run in {args.save_path}")
+        run_folder = make_run_folder(args.save_path, args.arch)
+    log = log_to_file(run_folder)
+    print(f"===> Saving the files of this run in {run_folder}")
 
     try:
         if args.recipe == "sgarnet":
@@ -586,9 +638,9 @@ def main() -> None:
             load_vgg19_weights()
 
         if args.num_GPUs > 1:
-            launch_distributed_training(args)
+            launch_distributed_training(args, run_folder)
         else:
-            run_training(args, single_process_context(use_cuda=args.num_GPUs > 0))
+            run_training(args, single_process_context(use_cuda=args.num_GPUs > 0), run_folder)
     except BaseException:
         # The error is shown on the screen as usual; this also keeps it in train.log.
         traceback.print_exc(file=log.file)

@@ -7,6 +7,7 @@ import numpy as np
 import numpy.typing as npt
 import random
 from collections import OrderedDict
+from pathlib import Path
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 from skimage.metrics import peak_signal_noise_ratio as psnr
@@ -59,20 +60,25 @@ def save_checkpoint(
     epoch: int,
     loss_stats: dict[str, list[float]],
     args: argparse.Namespace,
+    description: dict[str, Any],
+    folder: str,
     file_name: str,
 ) -> None:
-    """Saves the model weights, optimizer state, loss history and arguments as file_name in args.save_path.
+    """Saves the model description and weights, optimizer state, loss history and arguments as folder/file_name.
 
+    description: what the model is (model_factory.model_description), so the checkpoint can build its own model.
     With args.save_model_arch, the whole (trained) model object is saved too.
     """
     print(f"=> Saving checkpoint {file_name}")
     # checkpoint = {"state_dict": model.state_dict(), "optimizer": optimizer.state_dict(),}
     checkpoint: dict[str, Any] = {
+        "model": description,
         "state_dict": unwrap_module(model).state_dict(), 
         "optimizer": optimizer.state_dict(),
         "loss_stats": loss_stats, 
         "epoch": epoch, 
-        "args": args, 
+        # Plain text and numbers only: --config is a Path, on Linux a PosixPath, which Windows cannot load.
+        "args": {name: str(value) if isinstance(value, Path) else value for name, value in vars(args).items()},
         }
     
     if args.save_model_arch:
@@ -80,7 +86,7 @@ def save_checkpoint(
 
     # Written to a temporary file first, so an interrupted save never leaves a broken file behind
     # (net_best.pth.tar is overwritten every time validation improves).
-    path = os.path.join(args.save_path, file_name)
+    path = os.path.join(folder, file_name)
     torch.save(checkpoint, path + ".tmp")
     os.replace(path + ".tmp", path)
     # np.savez(args.save_path + "net_epoch_{}_info.npz".format(epoch), loss_stats=loss_stats, num_epochs=epoch, args=args)
@@ -137,7 +143,7 @@ def tensor2np(
     tensor: torch.Tensor, out_type: type[np.generic] = np.uint8, min_max: tuple[float, float] = (0, 1)
 ) -> npt.NDArray[Any]:
     """Converts a (C, H, W) tensor to a rounded (H, W, C) array of type out_type."""
-    tensor = tensor.float().detach().cpu().clamp_(*min_max)
+    tensor = tensor.float().detach().cpu().clamp(*min_max)
     # tensor = (tensor - min_max[0]) / (min_max[1] - min_max[0])  # to range [0, 1]
     img_np = tensor.numpy()
     img_np = np.transpose(img_np, (1, 2, 0))

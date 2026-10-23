@@ -46,10 +46,12 @@ def parse_args_with_config(
     tables = {name: config.pop(name) for name in list(config) if isinstance(config[name], dict)}
 
     actions = {action.dest: action for action in parser._actions if action.dest not in ("help", "config")}
-    architectures = actions["arch"].choices
+    if "arch" not in actions:
+        tables = {}  # the [arch] tables are for train.py; a script without --arch (evaluate.py) uses the top-level keys
     for name, options in [("", config), *tables.items()]:
-        if name and name not in architectures:
-            parser.error(f"unknown table [{name}] in {path}. Tables must be architectures: {', '.join(architectures)}")
+        if name and name not in actions["arch"].choices:
+            architectures = ", ".join(actions["arch"].choices)
+            parser.error(f"unknown table [{name}] in {path}. Tables must be architectures: {architectures}")
         for key in list(options):
             if key not in actions:
                 if ignore_unknown:
@@ -61,7 +63,7 @@ def parse_args_with_config(
                 parser.error(f"'{key}' in {path} must be {needed}, got {options[key]!r}")
 
     parser.set_defaults(**config)
-    arch = parser.parse_args(argv).arch
+    arch = getattr(parser.parse_args(argv), "arch", None)
     parser.set_defaults(**tables.get(arch, {}))
     args = parser.parse_args(argv)
 
