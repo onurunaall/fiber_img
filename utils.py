@@ -1,6 +1,5 @@
 from __future__ import annotations
 import argparse
-import math
 import os
 import time
 import numpy as np
@@ -125,16 +124,6 @@ def adjust_learning_rate(optimizer: Optimizer, epoch: int, lr_init: float, gamma
     """Sets the learning rate to lr_init * gamma ** (epoch // step_size)."""
     factor = epoch // step_size
     lr = lr_init * (gamma ** factor)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-
-def set_cosine_learning_rate(
-    optimizer: Optimizer, iteration: int, total_iterations: int, lr_init: float, eta_min: float
-) -> None:
-    """Sets the learning rate of a cosine decay from lr_init to eta_min at the given iteration."""
-    # Closed form of torch.optim.lr_scheduler.CosineAnnealingLR(T_max=total_iterations); iteration starts at 0
-    lr = eta_min + (lr_init - eta_min) * (1 + math.cos(math.pi * iteration / total_iterations)) / 2
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 

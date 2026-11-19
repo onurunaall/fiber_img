@@ -3,7 +3,7 @@
 Top-level keys are train.py option names (python train.py --help), e.g. num_epochs = 50.
 A table named after an architecture, e.g. [unet_edsr], holds options used only when that
 architecture is trained; they override the top-level keys. The file's options become argparse
-defaults, so the command line overrides them, e.g. --arch sgarnet switches the architecture.
+defaults, so the command line overrides them, e.g. --arch unet_edsr switches the architecture.
 """
 import argparse
 import tomllib

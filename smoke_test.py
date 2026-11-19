@@ -7,9 +7,9 @@ Then it covers unet, unet_v2, a small unet_edsr and unet_v2_edsr, --amp, the con
 checks), resuming with --pretrain (and that it stops when the model settings differ from the checkpoint's),
 --start_epoch, --save_model_arch, the setting checks, the files a run writes (checkpoints, train.log, plot), the model
 description in the checkpoints (also for old checkpoints without one), the run folders (a new run never touches an
-earlier run's files), evaluate.py with --config and without --arch, and, on a computer without a GPU, a run with
-2 processes (DistributedDataParallel).
-sgarnet is left out: its loss downloads the VGG19 weights (about 550 MB).
+earlier run's files), evaluate.py with --config and without --arch, transfer learning with --finetune_from (and the
+checks against a forgotten --pretrain), the fiber's reference image as a 2nd input channel (--reference_image), and,
+on a computer without a GPU, a run with 2 processes (DistributedDataParallel).
 """
 import argparse
 import subprocess
@@ -23,12 +23,15 @@ import torch
 from torch.nn import functional as F
 
 
-def make_images(folder: Path, count: int, seed: int) -> None:
-    """Writes count random 64 x 64 grayscale PNGs named img_0001.png, img_0002.png, ... into folder."""
+def make_images(folder: Path, count: int, seed: int, darkest: int = 0) -> None:
+    """Writes count random 64 x 64 grayscale PNGs named img_0001.png, img_0002.png, ... into folder.
+
+    Their pixel values are random between darkest and 255.
+    """
     folder.mkdir(parents=True)
     rng = np.random.default_rng(seed)
     for number in range(1, count + 1):
-        cv2.imwrite(str(folder / f"img_{number:04d}.png"), rng.integers(0, 256, (64, 64), dtype=np.uint8))
+        cv2.imwrite(str(folder / f"img_{number:04d}.png"), rng.integers(darkest, 256, (64, 64), dtype=np.uint8))
 
 
 def run_script(script: str, *options: str) -> subprocess.CompletedProcess[str]:
@@ -110,6 +113,25 @@ def check_memorize() -> None:
     print(f"A unet memorizes one image: L1 {first_loss:.4f} -> {loss.item():.4f}.", flush=True)
 
 
+def check_reference_follows_input(root: Path, reference: Path) -> None:
+    """With a reference image, random crops and flips move it exactly like the input image."""
+    from imageDatastore import imageDatastore
+
+    # The only input image and its target are copies of the reference image, so both channels of X and Z must
+    # stay equal, whatever crop and flips are drawn.
+    image = cv2.imread(str(reference), cv2.IMREAD_UNCHANGED)
+    for name in ("reference_X", "reference_Z"):
+        (root / name).mkdir()
+        cv2.imwrite(str(root / name / "img_0001.png"), image)
+    dataset = imageDatastore(str(root / "reference_Z"), str(root / "reference_X"), patches=True, patch_size=32,
+                             hflip=True, vflip=True, rotate=True, reference_image=str(reference))
+    for _ in range(20):
+        x, z = dataset[0]
+        assert x.shape == (2, 32, 32) and z.shape == (1, 32, 32), (x.shape, z.shape)
+        assert torch.equal(x[0], x[1]) and torch.equal(x[0], z[0]), "the reference image was not cropped and flipped like the input"
+    print("The reference image is cropped and flipped like the input image.", flush=True)
+
+
 def main() -> None:
     """Trains, resumes and checks the results; exits with an error message on the first failure."""
     check_metrics()
@@ -182,7 +204,7 @@ def main() -> None:
         assert {path.name: path.read_bytes() for path in unet.iterdir()} == unet_files, "a new run changed an earlier run's files"
         # The checkpoint says which model it holds, and stores the settings as plain text and numbers.
         edsr_checkpoint = load_checkpoint(edsr / "net_epoch_1.pth.tar")
-        assert edsr_checkpoint["model"] == {"arch": "unet_edsr", "n_colors": 1,
+        assert edsr_checkpoint["model"] == {"arch": "unet_edsr", "n_colors": 1, "in_channels": 1,
                                             "options": {"n_resblocks": 2, "n_feats": 16, "res_scale": 0.1}}, edsr_checkpoint
         edsr_args = edsr_checkpoint["args"]
         assert isinstance(edsr_args, dict) and edsr_args["amp"] is True, edsr_args
@@ -225,9 +247,71 @@ def main() -> None:
         del old_style["model"]
         old_style["args"] = argparse.Namespace(**old_style["args"])  # type: ignore[arg-type]
         torch.save(old_style, root / "old_style.pth.tar")
-        model_state = load_trained_model(root / "old_style.pth.tar").state_dict()
+        model_state = load_trained_model(root / "old_style.pth.tar")[0].state_dict()
         assert all(torch.equal(model_state[key], value) for key, value in old_style["state_dict"].items()), (  # type: ignore[union-attr]
             "an old-style checkpoint did not load")
+
+        # Transfer learning (--finetune_from): a new run on other data starts from the weights of a checkpoint only.
+        # The new targets are bright, so the new validation loss is worse than the best of the first run.
+        for name, count, seed, darkest in [("HR_Train_new", 8, 5, 200), ("sim_MCF_Train_new", 8, 6, 0),
+                                           ("HR_Valid_new", 4, 7, 200), ("sim_MCF_Valid_new", 4, 8, 0)]:
+            make_images(root / name, count, seed, darkest)
+        new_data = ("--dir_ZTrain", str(root / "HR_Train_new"), "--dir_XTrain", str(root / "sim_MCF_Train_new"),
+                    "--dir_ZValid", str(root / "HR_Valid_new"), "--dir_XValid", str(root / "sim_MCF_Valid_new"))
+        source = unet / "net_epoch_3.pth.tar"
+        # --lr 0: the weights cannot change, so the saved weights show which weights were loaded.
+        train_ok("--config", str(config), *new_data, "--arch", "unet", "--num_epochs", "2", "--lr", "0",
+                 "--save_path", str(root / "finetune"), "--finetune_from", str(source))
+        [finetune] = run_folders(root / "finetune")
+        source_checkpoint = load_checkpoint(source)
+        checkpoint = load_checkpoint(finetune / "net_epoch_2.pth.tar")
+        source_state, state = source_checkpoint["state_dict"], checkpoint["state_dict"]
+        assert isinstance(source_state, dict) and isinstance(state, dict)
+        assert all(torch.equal(state[key], value) for key, value in source_state.items()), (
+            "--finetune_from did not load the weights of the checkpoint")
+        source_stats, stats = source_checkpoint["loss_stats"], checkpoint["loss_stats"]
+        assert isinstance(source_stats, dict) and isinstance(stats, dict)
+        # Only the history of the new run, counted from epoch 1.
+        assert len(stats["train"]) == 2 and stats["valid_epoch"] == [1, 2], stats
+        assert min(stats["valid"]) > min(source_stats["valid"]), "the new data is not harder, so the next check shows nothing"
+        assert (finetune / "net_best.pth.tar").is_file(), "fine-tuning on harder data saved no net_best.pth.tar"
+        # The optimizer started new: 2 epochs x 2 batches = 4 steps (the checkpoint's optimizer had done 6).
+        steps = next(iter(checkpoint["optimizer"]["state"].values()))["step"]  # type: ignore[index]
+        assert int(steps) == 4, steps
+        assert "Fine-tuning from the weights" in (finetune / "train.log").read_text(encoding="utf-8")
+
+        # A forgotten --pretrain, a --start_epoch for a new run, and --finetune_from together with --pretrain all stop.
+        train_fails("--dir_pretrain is given without --pretrain", "--config", str(config),
+                    "--dir_pretrain", str(source), "--save_path", str(root / "x"))
+        train_fails("--start_epoch only works together with --pretrain", "--config", str(config),
+                    "--start_epoch", "2", "--save_path", str(root / "x"))
+        train_fails("use only one of them", "--config", str(config), "--pretrain", "--dir_pretrain", str(source),
+                    "--finetune_from", str(source), "--save_path", str(root / "x"))
+
+        # The fiber's reference image: the model gets it as a 2nd input channel, and the checkpoint says so.
+        reference = root / "white.png"
+        cv2.imwrite(str(reference), np.random.default_rng(9).integers(0, 256, (64, 64), dtype=np.uint8))
+        check_reference_follows_input(root, reference)
+        train_ok("--config", str(config), "--arch", "unet", "--num_epochs", "1", "--save_path", str(root / "reference"),
+                 "--reference_image", str(reference), "--patch_size", "32", "--augment", "flips+rot90")
+        [reference_run] = run_folders(root / "reference")
+        reference_checkpoint = load_checkpoint(reference_run / "net_epoch_1.pth.tar")
+        assert reference_checkpoint["model"] == {"arch": "unet", "n_colors": 1, "in_channels": 2, "options": {}}, (
+            reference_checkpoint["model"])
+        first_layer = reference_checkpoint["state_dict"]["ConvIn.0.weight"]  # type: ignore[index]
+        assert first_layer.shape == (8, 2, 3, 3), first_layer.shape
+        # evaluate.py needs the reference image for this checkpoint, and refuses it for one trained without.
+        evaluate = ("evaluate.py", "--config", str(config), "--warmup_iterations", "1", "--timed_iterations", "1")
+        run = run_script(*evaluate, "--checkpoint", str(reference_run / "net_epoch_1.pth.tar"),
+                         "--reference_image", str(reference))
+        assert run.returncode == 0 and "Valid L1" in run.stdout, run.stdout + run.stderr
+        run = run_script(*evaluate, "--checkpoint", str(reference_run / "net_epoch_1.pth.tar"))
+        assert run.returncode != 0 and "trained with a reference image" in run.stderr, run.stderr
+        run = run_script(*evaluate, "--checkpoint", str(unet / "net_best.pth.tar"), "--reference_image", str(reference))
+        assert run.returncode != 0 and "trained without a reference image" in run.stderr, run.stderr
+        # A checkpoint trained without the reference image cannot start a run with it: the first layer differs.
+        train_fails("holds the model", "--config", str(config), "--arch", "unet", "--reference_image", str(reference),
+                    "--finetune_from", str(unet / "net_best.pth.tar"), "--save_path", str(root / "x"))
 
         # A batch size that does not split across the GPUs stops before any GPU process starts.
         run = train("--config", str(config), "--num_GPUs", "2", "--val_batch_size", "1", "--save_path", str(root / "x"))

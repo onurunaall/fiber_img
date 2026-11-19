@@ -7,7 +7,6 @@ from typing import Any, cast
 import torch
 from torch import nn
 
-from model_SGARNet import SGARNet
 from model_UNET_EDSR import UNET, UNET_EDSR
 from utils import load_checkpoint
 
@@ -50,35 +49,12 @@ def build_unet_edsr(
     )
 
 
-def build_sgarnet(in_channels: int, out_channels: int, lattice_period_px: float, lattice_angle_deg: float) -> nn.Module:
-    # SGARNet adds its input to its output, so it needs as many output channels as input channels.
-    if in_channels != out_channels:
-        raise ValueError(f"SGARNet needs in_channels == out_channels, got {in_channels} and {out_channels}")
-
-    # Network and gate settings of options/train/MCFArtifactFree.yml in https://github.com/THUHoloLab/SGARNet
-    return SGARNet(
-        img_channel=in_channels,
-        width=32,
-        enc_blk_nums=[1, 1, 1, 14],
-        middle_blk_num=1,
-        dec_blk_nums=[1, 1, 1, 1],
-        gate_lattice_period_px=lattice_period_px,
-        gate_lattice_angle_deg=lattice_angle_deg,
-        gate_bandwidth=0.06,
-        gate_harmonics=(1, 2),
-        gate_alpha_max=0.7,
-        gate_init_alpha=0.0,
-        gate_per_channel=True,
-    )
-
-
 # To add an architecture: write a builder function and register it here under a new name.
 MODEL_BUILDERS: dict[str, ModelBuilder] = {
     "unet": build_unet,
     "unet_v2": partial(build_unet, full_size_skip=True),
     "unet_edsr": build_unet_edsr,
     "unet_v2_edsr": partial(build_unet_edsr, full_size_skip=True),
-    "sgarnet": build_sgarnet,
 }
 
 
@@ -98,18 +74,7 @@ def architecture_options(architecture: str, args: argparse.Namespace) -> dict[st
             # Checkpoints from before this option were trained with 1.0.
             "res_scale": getattr(args, "edsr_res_scale", 1.0),
         }
-
-    if architecture != "sgarnet":
-        return {}
-
-    period = getattr(args, "sgarnet_lattice_period", None)
-    angle = getattr(args, "sgarnet_lattice_angle", None)
-    if period is None or angle is None:
-        raise ValueError(
-            "SGARNet needs --sgarnet_lattice_period and --sgarnet_lattice_angle. "
-            "Run estimate_lattice_period.py on the training inputs to measure them."
-        )
-    return {"lattice_period_px": period, "lattice_angle_deg": angle}
+    return {}
 
 
 def model_description(args: argparse.Namespace) -> ModelDescription:
@@ -118,12 +83,18 @@ def model_description(args: argparse.Namespace) -> ModelDescription:
     Saved in every checkpoint as checkpoint["model"], so the checkpoint can build its own model again.
     """
     architecture = getattr(args, "arch", "unet")  # the first train.py (before --arch existed) only trained the unet
-    return {"arch": architecture, "n_colors": args.n_colors, "options": architecture_options(architecture, args)}
+    # in_channels: the image channels, plus 1 when the fiber's reference image is an extra input channel.
+    in_channels = args.n_colors + (1 if getattr(args, "reference_image", None) else 0)
+    return {"arch": architecture, "n_colors": args.n_colors, "in_channels": in_channels,
+            "options": architecture_options(architecture, args)}
 
 
 def saved_model_description(checkpoint: Mapping[str, Any]) -> ModelDescription:
     """The model description of a checkpoint. Checkpoints from before 2026-10-22 have none: their 'args' hold it."""
-    return checkpoint["model"] if "model" in checkpoint else model_description(checkpoint["args"])
+    description = dict(checkpoint["model"]) if "model" in checkpoint else model_description(checkpoint["args"])
+    # Checkpoints from before the reference image (2026-11-13) have no "in_channels": their input is the image alone.
+    description.setdefault("in_channels", description["n_colors"])
+    return description
 
 
 def build_model(architecture: str, in_channels: int, out_channels: int, **options: Any) -> nn.Module:
@@ -136,19 +107,34 @@ def build_model(architecture: str, in_channels: int, out_channels: int, **option
 
 
 def build_described_model(description: ModelDescription) -> nn.Module:
-    n_colors = description["n_colors"]
-    return build_model(description["arch"], in_channels=n_colors, out_channels=n_colors, **description["options"])
+    return build_model(description["arch"], in_channels=description["in_channels"],
+                       out_channels=description["n_colors"], **description["options"])
 
 
-def load_trained_model(checkpoint_path: Path) -> nn.Module:
-    """The model of a train.py checkpoint, with its weights, in eval mode. The checkpoint says what model it is."""
+def check_reference(description: ModelDescription, reference_image: str | None) -> None:
+    """Stops if a model trained with a reference image gets none, or a model trained without one gets one."""
+    needs_reference = description["in_channels"] > description["n_colors"]
+    if needs_reference and reference_image is None:
+        raise ValueError("This checkpoint was trained with a reference image of the fiber: "
+                         "give that image with --reference_image FILE.")
+    if not needs_reference and reference_image is not None:
+        raise ValueError("This checkpoint was trained without a reference image: "
+                         "leave out --reference_image (also in the config file).")
+
+
+def load_trained_model(checkpoint_path: Path) -> tuple[nn.Module, ModelDescription]:
+    """The model of a train.py checkpoint, with its weights, in eval mode, and its description.
+
+    The checkpoint says what model it is.
+    """
     # weights_only=False: old checkpoints store 'args' as an argparse.Namespace, and --save_model_arch stores the whole
     # model object. Only load checkpoint files you trust.
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-    model = build_described_model(saved_model_description(checkpoint))
+    description = saved_model_description(checkpoint)
+    model = build_described_model(description)
     load_checkpoint(checkpoint, model)
-    return model.eval()
+    return model.eval(), description
 
 
 def compile_model(model: nn.Module, mode: str) -> nn.Module:

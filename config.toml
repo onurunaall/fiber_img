@@ -2,10 +2,10 @@
 # Every key is a train.py option (python train.py --help). Command-line options override this file,
 # e.g.  python train.py --config config.toml --arch unet_edsr --num_epochs 5
 #
-# Top-level keys apply to every architecture. The [unet], [unet_v2], [unet_edsr], [unet_v2_edsr] and
-# [sgarnet] tables below apply only to that architecture and override the top-level keys.
+# Top-level keys apply to every architecture. The [unet], [unet_v2], [unet_edsr] and [unet_v2_edsr]
+# tables below apply only to that architecture and override the top-level keys.
 
-arch = "unet"                # unet, unet_v2, unet_edsr, unet_v2_edsr or sgarnet
+arch = "unet"                # unet, unet_v2, unet_edsr or unet_v2_edsr
 
 # Data: Z = HR target, X = sim_MCF input. Height and width must be multiples of 16.
 # The folders on Kai. Change them here if your data is elsewhere.
@@ -15,13 +15,15 @@ dir_ZValid = "/scratch/ouenal/fiber_data/720/HR_Valid"
 dir_XValid = "/scratch/ouenal/fiber_data/720/sim_MCF_Valid"
 n_colors = 1
 ext = ".png"
+# White image of the fiber as an extra input channel of the model. A model trained with it is another model than
+# one trained without: it needs its own pre-training, and evaluate.py / save_test_preds.py need the image too.
+# reference_image = ".../calib/sim_cfb_white.png"
 
-# Training. The recipe follows arch (every arch but sgarnet uses the unet recipe). Left out here, lr,
-# batch_size, patch_size and augment get the recipe's default (python train.py --help shows them);
-# set them in a table below to change them.
+# Training. Left out here, lr, batch_size, patch_size and augment get train.py's defaults
+# (python train.py --help shows them); set them in a table below to change them.
 num_epochs = 50
 val_batch_size = 4           # global batch size, split across num_GPUs
-lr_DropFactor = 0.5          # unet recipe: lr *= lr_DropFactor every lr_DropPeriod epochs
+lr_DropFactor = 0.5          # lr *= lr_DropFactor every lr_DropPeriod epochs
 lr_DropPeriod = 10
 seed = 1
 
@@ -71,10 +73,3 @@ batch_size = 1               # one 720 x 720 image per step: batch size 4 does n
 amp = true                   # bfloat16 mixed precision
 val_batch_size = 1           # validation always uses full images
 save_path = "/scratch/ouenal/runs/unet_v2_edsr"
-
-
-[sgarnet]
-# Required for sgarnet: measure them with estimate_lattice_period.py on the training inputs.
-# sgarnet_lattice_period = 0.0
-# sgarnet_lattice_angle = 0.0
-save_path = "/scratch/ouenal/runs/sgarnet"

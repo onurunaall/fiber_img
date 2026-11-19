@@ -60,7 +60,8 @@ class imageDatastore(data.Dataset[tuple[torch.Tensor, torch.Tensor]]):
                  hflip: bool = False,
                  vflip: bool = False,
                  rotate: bool = False,
-                 ext: str = ".png") -> None:
+                 ext: str = ".png",
+                 reference_image: str | None = None) -> None:
         """Lists the image pairs and checks that file i of dir_X matches file i of dir_Z."""
 
         self.dir_Z = dir_Z
@@ -85,11 +86,15 @@ class imageDatastore(data.Dataset[tuple[torch.Tensor, torch.Tensor]]):
         self.num_train = len(self.list_Z)
         self._check_pairs()
 
+        # The white image of the fiber (reference_image: its file path), or None. Read once: every pair uses the same.
+        self.reference = None if reference_image is None else self._load_reference(reference_image)
+
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns pair idx as (X, Z) tensors, cropped and augmented as configured."""
         X, Z = self._load_file(idx)
         
         X, Z = common.set_channel(X, Z, n_channels=self.n_colors)
+        X = self._add_reference(X)
         X, Z = self._get_patch(X, Z)
         X, Z = self._augment_data(X, Z)
         
@@ -120,6 +125,22 @@ class imageDatastore(data.Dataset[tuple[torch.Tensor, torch.Tensor]]):
             if num_X != num_Z:
                 raise ValueError('Pair mismatch: %s <-> %s' % (path_X, path_Z))
     
+    def _load_reference(self, path: str) -> npt.NDArray[Any]:
+        """Reads the reference image as an (H, W, 1) array."""
+        reference = default_loader(path, 1)
+        if reference.ndim != 2:
+            raise ValueError('The reference image must have 1 channel (gray), got shape %s: %s' % (reference.shape, path))
+        return reference[:, :, np.newaxis]
+
+    def _add_reference(self, imgX: npt.NDArray[Any]) -> npt.NDArray[Any]:
+        """Adds the reference image to X as an extra channel, so crops and flips treat it exactly like X."""
+        if self.reference is None:
+            return imgX
+        if self.reference.shape[:2] != imgX.shape[:2] or self.reference.dtype != imgX.dtype:
+            raise ValueError('The reference image (%s, %s) must have the size and bit depth of the input images (%s, %s)'
+                             % (self.reference.shape[:2], self.reference.dtype, imgX.shape[:2], imgX.dtype))
+        return np.concatenate([imgX, self.reference], axis=2)
+
     def _get_patch(
         self, imgX: npt.NDArray[Any], imgZ: npt.NDArray[Any]
     ) -> tuple[npt.NDArray[Any], npt.NDArray[Any]]:

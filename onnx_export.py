@@ -64,8 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export a trained checkpoint to ONNX.")
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path, help="path of the .onnx file to write")
-    # No --arch: the checkpoint says which model it holds.
-    parser.add_argument("--n_colors", default=1, type=int, help="number of color channels of the input")
+    # No --arch and no --n_colors: the checkpoint says which model it holds and how many input channels it has.
     parser.add_argument("--height", required=True, type=int, help="input image height")
     parser.add_argument("--width", required=True, type=int, help="input image width")
     parser.add_argument("--precision", default="fp32", choices=["fp32", "fp16"])
@@ -75,8 +74,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    model = load_trained_model(args.checkpoint)
-    export_to_onnx(model, args.output, args.n_colors, args.height, args.width, args.precision)
+    model, description = load_trained_model(args.checkpoint)
+    export_to_onnx(model, args.output, description["in_channels"], args.height, args.width, args.precision)
     print(f"Saved {args.output}")
 
 

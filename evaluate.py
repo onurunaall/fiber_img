@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 
 from config_file import parse_args_with_config
 from imageDatastore import imageDatastore
-from model_factory import COMPILE_MODES, compile_model, load_trained_model
+from model_factory import COMPILE_MODES, check_reference, compile_model, load_trained_model
 from validation import Predictor, accumulate_validation_totals, compute_validation_result
 
 
@@ -29,6 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dir_ZValid", default=None, type=str, help="folder of the validation targets (HR)")
     parser.add_argument("--dir_XValid", default=None, type=str, help="folder of the validation inputs (sim_MCF)")
     parser.add_argument("--n_colors", default=1, type=int, help="number of color channels to use")
+    parser.add_argument("--reference_image", default=None, type=str,
+                        help="white image of the fiber: needed if the model was trained with --reference_image")
     parser.add_argument("--rgb_range", default=1, type=int, help="maxium value of RGB")
     parser.add_argument("--ext", default=".png", type=str)
     parser.add_argument("--val_batch_size", default=4, type=int)
@@ -55,7 +57,9 @@ def load_predictor(args: argparse.Namespace, device: torch.device) -> Predictor:
 
         return TensorRTModel(args.engine, device)
 
-    model = load_trained_model(args.checkpoint).to(device)
+    model, description = load_trained_model(args.checkpoint)
+    check_reference(description, args.reference_image)
+    model = model.to(device)
     if args.compile:
         model = compile_model(model, args.compile_mode)
     return model
@@ -100,6 +104,7 @@ def main() -> None:
         n_colors=args.n_colors,
         rgb_range=args.rgb_range,
         ext=args.ext,
+        reference_image=args.reference_image,
     )
     loader = DataLoader(
         dataset,

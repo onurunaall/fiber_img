@@ -5,12 +5,12 @@ import os
 import re
 import sys
 import traceback
+from typing import Any
 
 import torch
 import torch.multiprocessing as mp
 from matplotlib.figure import Figure
 from torch import nn, optim
-from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 from tqdm import tqdm
@@ -27,13 +27,11 @@ from distributed_utils import (
     sum_across_processes,
 )
 from imageDatastore import imageDatastore
-from losses import SGARNetLoss, load_vgg19_weights
 from model_factory import (
     COMPILE_MODES,
     EDSR_DEFAULT_FEATS,
     EDSR_DEFAULT_RESBLOCKS,
     ModelDescription,
-    architecture_options,
     available_architectures,
     build_described_model,
     compile_model,
@@ -45,7 +43,6 @@ from utils import (
     adjust_learning_rate,
     load_checkpoint,
     save_checkpoint,
-    set_cosine_learning_rate,
     setup_seed,
     time_text,
 )
@@ -59,48 +56,22 @@ PROGRESS_EVERY = 20
 
 type LossStats = dict[str, list[float]]
 
-# Training recipes:
-#   unet:    (also used for --arch unet_v2, unet_edsr and unet_v2_edsr) L1 loss, Adam, step decay (lr_DropFactor every lr_DropPeriod epochs), full images, no augmentation.
-#   sgarnet: options/train/MCFArtifactFree.yml of https://github.com/THUHoloLab/SGARNet: PSNR loss
-#            + 0.01 * VGG19 perceptual loss, AdamW, cosine decay per iteration, gradient clipping,
-#            random crops with flips and rot90.
-# --recipe auto picks the recipe named like --arch. Options left out on the command line get the
-# recipe's default below.
-RECIPE_DEFAULTS: dict[str, dict[str, object]] = {
-    "unet": {"lr": 1e-4, "batch_size": 4, "patch_size": 0, "augment": "none"},
-    "sgarnet": {"lr": 1e-3, "batch_size": 8, "patch_size": 368, "augment": "flips+rot90"},
-}
-SGARNET_WEIGHT_DECAY = 1e-3
-SGARNET_BETAS = (0.9, 0.9)
-SGARNET_ETA_MIN = 1e-7
-SGARNET_GRAD_CLIP_NORM = 0.01
-
-
-def recipe_defaults_text(name: str) -> str:
-    """The default of option name in each recipe, e.g. 'unet 4, sgarnet 8', taken from RECIPE_DEFAULTS."""
-    return ", ".join(f"{recipe} {defaults[name]}" for recipe, defaults in RECIPE_DEFAULTS.items())
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="net")
 
     # Training
     parser.add_argument("--num_epochs", default=50, type=int)
-    parser.add_argument("--recipe", default="auto", choices=["auto", *RECIPE_DEFAULTS],
-                        help="training recipe; auto: sgarnet for --arch sgarnet, otherwise unet")
-    parser.add_argument("--batch_size", default=None, type=int,
-                        help=f"global batch size, split across all GPUs (default: {recipe_defaults_text('batch_size')})")
+    parser.add_argument("--batch_size", default=4, type=int, help="global batch size, split across all GPUs")
     parser.add_argument("--val_batch_size", default=4, type=int, help="global batch size, split across all GPUs")
-    parser.add_argument("--lr", default=None, type=float,
-                        help=f"initial learning rate (default: {recipe_defaults_text('lr')})")
-    parser.add_argument("--lr_DropFactor", default=0.5, type=float, help="unet recipe only")
-    parser.add_argument("--lr_DropPeriod", default=10, type=int, help="unet recipe only")
-    parser.add_argument("--patch_size", default=None, type=int,
-                        help="train on random square crops of this size, 0: full images "
-                             f"(default: {recipe_defaults_text('patch_size')})")
-    parser.add_argument("--augment", default=None, choices=["none", "flips", "flips+rot90"],
-                        help="random flips / 90-degree rotations of the training images "
-                             f"(default: {recipe_defaults_text('augment')})")
+    parser.add_argument("--lr", default=1e-4, type=float, help="initial learning rate")
+    parser.add_argument("--lr_DropFactor", default=0.5, type=float,
+                        help="the learning rate is multiplied by this every lr_DropPeriod epochs")
+    parser.add_argument("--lr_DropPeriod", default=10, type=int)
+    parser.add_argument("--patch_size", default=0, type=int,
+                        help="train on random square crops of this size, 0: full images")
+    parser.add_argument("--augment", default="none", choices=["none", "flips", "flips+rot90"],
+                        help="random flips / 90-degree rotations of the training images")
     parser.add_argument("--save_everyEpoch", default=10, type=int, help="save net_epoch_N.pth.tar every this many epochs")
     parser.add_argument("--save_path", default="./folder/", type=str,
                         help="every new run saves its files in a new subfolder <date>_<time>_<arch> of this folder; "
@@ -116,10 +87,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", action="store_true",
                         help="train in bfloat16 mixed precision: about half the GPU memory and faster. Needs an "
                              "Ampere or newer GPU (e.g. RTX A6000, A100). Validation stays in float32.")
-    parser.add_argument("--sgarnet_lattice_period", default=None, type=float,
-                        help="SGARNet: core lattice period in input pixels, from estimate_lattice_period.py")
-    parser.add_argument("--sgarnet_lattice_angle", default=None, type=float,
-                        help="SGARNet: core lattice angle in degrees, from estimate_lattice_period.py")
     parser.add_argument("--edsr_n_resblocks", default=EDSR_DEFAULT_RESBLOCKS, type=int,
                         help="unet_edsr and unet_v2_edsr: number of EDSR residual blocks")
     parser.add_argument("--edsr_n_feats", default=EDSR_DEFAULT_FEATS, type=int,
@@ -134,20 +101,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dir_ZValid", default=None, type=str, help="folder of the validation targets (HR)")
     parser.add_argument("--dir_XValid", default=None, type=str, help="folder of the validation inputs (sim_MCF)")
     parser.add_argument("--n_colors", default=1, type=int, help="number of color channels to use")
+    parser.add_argument("--reference_image", default=None, type=str,
+                        help="white image of the fiber (e.g. calib/sim_cfb_white.png): the model gets it as an extra "
+                             "input channel next to every input image. Changes the model, so it needs its own training.")
 
     # Pre-train
     parser.add_argument("--pretrain", action="store_true", help="load pre-trained model")
     parser.add_argument("--dir_pretrain", default="", type=str, help="path1 to checkpoint")
     parser.add_argument("--start_epoch", "--start-epoch", default=None, type=int,
                         help="first epoch to train (default: the epoch after the --pretrain checkpoint, otherwise 1). "
+                             "Only with --pretrain; to train on new data use --finetune_from. "
                              "The old spelling --start-epoch also works.")
+    parser.add_argument("--finetune_from", default="", type=str,
+                        help="transfer learning: start a new run from the weights of this checkpoint. Only the weights "
+                             "are loaded: epoch 1, new optimizer, new loss history, new run folder.")
 
     parser.add_argument("--save_model_arch", action="store_true",
                         help="also save the whole trained model object in every checkpoint")
     parser.add_argument("--rgb_range", default=1, type=int, help="maxium value of RGB")
     parser.add_argument("--seed", default=1, type=int)
     parser.add_argument("--ext", default=".png", type=str)
-    args = resolve_recipe(parse_args_with_config(parser))
+    args = parse_args_with_config(parser)
 
     missing = [name for name in DATA_FOLDERS if getattr(args, name) is None]
     if missing:
@@ -162,22 +136,27 @@ def parse_args() -> argparse.Namespace:
     # Checked here: a resumed run saves its files in the folder of this checkpoint.
     if args.pretrain and not os.path.isfile(args.dir_pretrain):
         parser.error(f"--dir_pretrain '{args.dir_pretrain}' is not a checkpoint file")
+    # Checked here: with a forgotten --pretrain, training would silently start from random weights.
+    if args.dir_pretrain and not args.pretrain:
+        parser.error("--dir_pretrain is given without --pretrain, so the checkpoint would not be loaded. Add --pretrain "
+                     "to continue that run, or use --finetune_from FILE to start a new run from its weights.")
+    # The learning rate is computed from the epoch number, so a new run must start at epoch 1.
+    if args.start_epoch is not None and not args.pretrain:
+        parser.error("--start_epoch only works together with --pretrain. To train on new data from the weights of "
+                     "a checkpoint, use --finetune_from FILE (it starts at epoch 1).")
+    if args.finetune_from:
+        if args.pretrain:
+            parser.error("--finetune_from starts a new run and --pretrain continues an old one: use only one of them")
+        if not os.path.isfile(args.finetune_from):
+            parser.error(f"--finetune_from '{args.finetune_from}' is not a checkpoint file")
+    if args.reference_image is not None and not os.path.isfile(args.reference_image):
+        parser.error(f"--reference_image '{args.reference_image}' is not a file")
 
     # Each GPU gets an equal share of every batch. Checked here, before the GPU processes start.
     for name in ("batch_size", "val_batch_size"):
         size = getattr(args, name)
         if args.num_GPUs > 1 and size % args.num_GPUs != 0:
             parser.error(f"--{name} {size} must be divisible by --num_GPUs {args.num_GPUs}")
-    return args
-
-
-def resolve_recipe(args: argparse.Namespace) -> argparse.Namespace:
-    if args.recipe == "auto":
-        args.recipe = "sgarnet" if args.arch == "sgarnet" else "unet"
-
-    for name, value in RECIPE_DEFAULTS[args.recipe].items():
-        if getattr(args, name) is None:
-            setattr(args, name, value)
     return args
 
 
@@ -196,6 +175,7 @@ def create_train_loader(
         vflip=args.augment != "none",
         rotate=args.augment == "flips+rot90",
         ext=args.ext,
+        reference_image=args.reference_image,
     )
 
     if args.patch_size > 0:
@@ -243,6 +223,7 @@ def create_valid_loader(args: argparse.Namespace, context: DistributedContext) -
         n_colors=args.n_colors,
         rgb_range=args.rgb_range,
         ext=args.ext,
+        reference_image=args.reference_image,
     )
 
     # Every process validates every world_size-th image. Unlike DistributedSampler,
@@ -291,29 +272,19 @@ def train_one_epoch(
     optimizer: optim.Optimizer,
     args: argparse.Namespace,
     context: DistributedContext,
-) -> tuple[float, float]:
-    """Returns (L1 loss, training loss) averaged over the epoch. With the unet recipe both are the L1 loss."""
+) -> float:
+    """Returns the training L1 loss averaged over the epoch."""
     model.train()
-    first_iteration = (epoch - 1) * len(loader)
-    total_iterations = args.num_epochs * len(loader)
-    if args.recipe == "sgarnet":
-        set_cosine_learning_rate(optimizer, first_iteration, total_iterations, args.lr, SGARNET_ETA_MIN)
-    else:
-        adjust_learning_rate(optimizer, epoch - 1, args.lr, args.lr_DropFactor, args.lr_DropPeriod)
+    adjust_learning_rate(optimizer, epoch - 1, args.lr, args.lr_DropFactor, args.lr_DropPeriod)
 
     learning_rate = optimizer.param_groups[0]["lr"]
     print_on_main(context, f"\n------- Epoch {epoch}/{args.num_epochs} \t\t lr = {learning_rate}")
 
     progress = tqdm(loader, desc="In training", leave=True, ncols=80, disable=not context.is_main_process)
-    # The sums stay on the GPU, so the CPU never has to wait for the GPU to add them up.
+    # The sum stays on the GPU, so the CPU never has to wait for the GPU to add it up.
     total_loss = torch.zeros((), device=context.device)
-    total_l1 = torch.zeros((), device=context.device)
 
     for batch_index, (inputs, targets) in enumerate(progress):
-        if args.recipe == "sgarnet":
-            # Like the original, the cosine learning rate changes every iteration.
-            set_cosine_learning_rate(optimizer, first_iteration + batch_index, total_iterations, args.lr, SGARNET_ETA_MIN)
-
         # non_blocking: the copy runs while the CPU already queues the next GPU work (the loader pins the memory).
         inputs = inputs.to(context.device, non_blocking=True)
         targets = targets.float().to(context.device, non_blocking=True)
@@ -326,28 +297,15 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        if args.recipe == "sgarnet":
-            nn.utils.clip_grad_norm_(model.parameters(), SGARNET_GRAD_CLIP_NORM)
         optimizer.step()
 
         total_loss += loss.detach()
-        if args.recipe == "unet":
-            if batch_index % PROGRESS_EVERY == 0:
-                progress.set_postfix(loss=loss.item())
-        else:
-            l1 = F.l1_loss(predictions.detach().float(), targets)
-            total_l1 += l1
-            if batch_index % PROGRESS_EVERY == 0:
-                progress.set_postfix(loss=loss.item(), l1=l1.item())
+        if batch_index % PROGRESS_EVERY == 0:
+            progress.set_postfix(loss=loss.item())
 
     epoch_loss = mean_across_processes(total_loss.item() / len(loader), context)
-    if args.recipe == "unet":
-        print_on_main(context, f"\nTrain loss: {epoch_loss:.4f}")
-        return epoch_loss, epoch_loss
-
-    epoch_l1 = mean_across_processes(total_l1.item() / len(loader), context)
-    print_on_main(context, f"\nTrain loss: {epoch_loss:.4f} \t\t Train L1: {epoch_l1:.4f}")
-    return epoch_l1, epoch_loss
+    print_on_main(context, f"\nTrain loss: {epoch_loss:.4f}")
+    return epoch_loss
 
 
 def validate(
@@ -366,12 +324,6 @@ def validate(
     return result
 
 
-def create_optimizer(network: nn.Module, args: argparse.Namespace) -> optim.Optimizer:
-    if args.recipe == "sgarnet":
-        return optim.AdamW(network.parameters(), lr=args.lr, weight_decay=SGARNET_WEIGHT_DECAY, betas=SGARNET_BETAS)
-    return optim.Adam(network.parameters(), lr=args.lr)
-
-
 def check_amp_support(args: argparse.Namespace, context: DistributedContext) -> None:
     """Stops with a clear message if --amp is on but the GPU cannot compute in bfloat16."""
     if args.amp and context.device.type == "cuda" and not torch.cuda.is_bf16_supported(including_emulation=False):
@@ -379,6 +331,20 @@ def check_amp_support(args: argparse.Namespace, context: DistributedContext) -> 
             f"--amp needs a GPU with bfloat16 support (Ampere or newer), "
             f"but {torch.cuda.get_device_name(context.device)} has none. Train without --amp."
         )
+
+
+def read_checkpoint(path: str, description: ModelDescription, context: DistributedContext) -> dict[str, Any]:
+    """Reads a checkpoint file. Stops if it holds another model than the settings of this run build."""
+    # weights_only=False: old checkpoints store 'args' as an argparse.Namespace, and --save_model_arch stores the whole
+    # model object. Only load checkpoint files you trust.
+    checkpoint: dict[str, Any] = torch.load(path, map_location=context.device, weights_only=False)
+    saved = saved_model_description(checkpoint)
+    if saved != description:
+        raise ValueError(
+            f"{path} holds the model {saved}, but the settings of this run build {description}. "
+            "Use the same --arch, --n_colors, --edsr_* options and --reference_image (given or not) as the checkpoint."
+        )
+    return checkpoint
 
 
 def load_pretrained(
@@ -392,15 +358,7 @@ def load_pretrained(
 
     Stops if the checkpoint holds another model than the settings of this run build.
     """
-    # weights_only=False: old checkpoints store 'args' as an argparse.Namespace, and --save_model_arch stores the whole
-    # model object. Only load checkpoint files you trust.
-    checkpoint = torch.load(args.dir_pretrain, map_location=context.device, weights_only=False)
-    saved = saved_model_description(checkpoint)
-    if saved != description:
-        raise ValueError(
-            f"{args.dir_pretrain} holds the model {saved}, but the settings of this run build {description}. "
-            "Use the same --arch, --n_colors and --edsr_* options as the checkpoint."
-        )
+    checkpoint = read_checkpoint(args.dir_pretrain, description, context)
     load_checkpoint(checkpoint, network)
     optimizer.load_state_dict(checkpoint["optimizer"])
 
@@ -417,14 +375,12 @@ def load_pretrained(
     return start_epoch, dict(checkpoint["loss_stats"])
 
 
-def complete_loss_stats(loss_stats: LossStats, args: argparse.Namespace) -> LossStats:
+def complete_loss_stats(loss_stats: LossStats) -> LossStats:
     """Adds the lists that a new run, or a checkpoint from before they were saved, does not have yet."""
     loss_stats.setdefault("valid_epoch", list(range(1, len(loss_stats["valid"]) + 1)))
     # Checkpoints from before PSNR and SSIM were saved get nan for their earlier validations.
     for key in ("valid_psnr", "valid_ssim"):
         loss_stats.setdefault(key, [math.nan] * len(loss_stats["valid"]))
-    if args.recipe != "unet":
-        loss_stats.setdefault("train_objective", [])
     return loss_stats
 
 
@@ -472,16 +428,20 @@ def run_training(args: argparse.Namespace, context: DistributedContext, run_fold
     description = model_description(args)
     network = build_described_model(description).to(context.device)
 
-    # Validation (and the choice of the best checkpoint) always uses the L1 loss, so all recipes are compared alike.
     criterion = nn.L1Loss().to(context.device)
-    training_criterion = SGARNetLoss().to(context.device) if args.recipe == "sgarnet" else criterion
-    optimizer = create_optimizer(network, args)
+    optimizer = optim.Adam(network.parameters(), lr=args.lr)
 
     start_epoch = 1 if args.start_epoch is None else args.start_epoch
     loss_stats: LossStats = {"train": [], "valid": [], "valid_expt": []}
     if args.pretrain:
         start_epoch, loss_stats = load_pretrained(args, description, network, optimizer, context)
-    loss_stats = complete_loss_stats(loss_stats, args)
+    elif args.finetune_from:
+        # Transfer learning: only the weights are taken over. The optimizer, the loss history and the epoch count
+        # start new, so net_best.pth.tar is the best model on the new data.
+        load_checkpoint(read_checkpoint(args.finetune_from, description, context), network)
+        print_on_main(context, f"===> Fine-tuning from the weights of {args.finetune_from} "
+                               "(new optimizer, new loss history, epoch 1)")
+    loss_stats = complete_loss_stats(loss_stats)
     check_nothing_overwritten(run_folder, start_epoch)
     best_valid_loss = best_valid_loss_so_far(run_folder, loss_stats)
 
@@ -489,7 +449,7 @@ def run_training(args: argparse.Namespace, context: DistributedContext, run_fold
 
     print_on_main(
         context,
-        f"===> Training {args.arch} with the {args.recipe} recipe: lr {args.lr}, batch size {args.batch_size}, "
+        f"===> Training {args.arch}: lr {args.lr}, batch size {args.batch_size}, "
         f"patch size {args.patch_size or 'full image'}, augment {args.augment}, "
         f"bfloat16 mixed precision {'on' if args.amp else 'off'}",
     )
@@ -501,12 +461,8 @@ def run_training(args: argparse.Namespace, context: DistributedContext, run_fold
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        loss_train, objective_train = train_one_epoch(
-            epoch, training_model, train_loader, training_criterion, optimizer, args, context
-        )
+        loss_train = train_one_epoch(epoch, training_model, train_loader, criterion, optimizer, args, context)
         loss_stats["train"].append(loss_train)
-        if args.recipe != "unet":
-            loss_stats["train_objective"].append(objective_train)
 
         do_valid = epoch % args.valid_everyEpoch == 0 or epoch == args.num_epochs
         if do_valid:
@@ -618,9 +574,6 @@ def launch_distributed_training(args: argparse.Namespace, run_folder: str) -> No
 def main() -> None:
     args = parse_args()
 
-    # Stop now, before any GPU process starts, if a setting of the architecture is missing.
-    architecture_options(args.arch, args)
-
     # Decided here, before any GPU process starts, so that all of them save into the same folder.
     # args.save_path stays the parent folder of the settings; run_folder is the folder of this run.
     if args.pretrain and args.start_epoch is None:
@@ -633,10 +586,6 @@ def main() -> None:
     print(f"===> Saving the files of this run in {run_folder}")
 
     try:
-        if args.recipe == "sgarnet":
-            # Download the VGG19 weights once here, so the GPU processes do not all download them at the same time.
-            load_vgg19_weights()
-
         if args.num_GPUs > 1:
             launch_distributed_training(args, run_folder)
         else:

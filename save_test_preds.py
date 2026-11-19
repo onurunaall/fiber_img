@@ -1,6 +1,6 @@
 """Saves the prediction of every image pair, plus a side-by-side comparison.
 
-Usage:  python save_test_preds.py CHECKPOINT DIR_Z DIR_X OUT_DIR [--n_colors N]
+Usage:  python save_test_preds.py CHECKPOINT DIR_Z DIR_X OUT_DIR [--n_colors N] [--reference_image FILE]
 The checkpoint says which model it holds. Writes OUT_DIR/pred/<name>_pred.png and
 OUT_DIR/compare/<name>_compare.png (left: sim_MCF input, middle: prediction, right: HR target).
 """
@@ -13,7 +13,7 @@ import numpy.typing as npt
 import torch
 
 from imageDatastore import imageDatastore
-from model_factory import load_trained_model
+from model_factory import check_reference, load_trained_model
 from utils import tensor2np
 
 
@@ -24,6 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("dir_x", help="folder of the sim_MCF inputs")
     parser.add_argument("out_dir", help="the pred/ and compare/ folders are made here")
     parser.add_argument("--n_colors", default=1, type=int, help="number of color channels to use")
+    parser.add_argument("--reference_image", default=None, type=str,
+                        help="white image of the fiber: needed if the model was trained with --reference_image")
     return parser.parse_args()
 
 
@@ -39,15 +41,18 @@ def main() -> None:
     os.makedirs(os.path.join(args.out_dir, "compare"), exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_trained_model(args.checkpoint).to(device)
-    dataset = imageDatastore(args.dir_z, args.dir_x, n_colors=args.n_colors)
+    model, description = load_trained_model(args.checkpoint)
+    check_reference(description, args.reference_image)
+    model = model.to(device)
+    dataset = imageDatastore(args.dir_z, args.dir_x, n_colors=args.n_colors, reference_image=args.reference_image)
 
     with torch.no_grad():
         for index in range(len(dataset)):
             input_tensor, target_tensor = dataset[index]
             prediction = model(input_tensor.unsqueeze(0).to(device))[0]
 
-            input_img = to_cv2_image(input_tensor)
+            # Only the image channels: with a reference image, the input has it as an extra channel.
+            input_img = to_cv2_image(input_tensor[:args.n_colors])
             pred_img = to_cv2_image(prediction)
             target_img = to_cv2_image(target_tensor)
 
